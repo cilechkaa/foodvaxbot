@@ -13,10 +13,6 @@ except ImportError:
 # -*- coding: utf-8 -*-
 """
 КОТЛЕТЫ И СТЕЙК 89 — бот для мессенджера MAX
-(порт Telegram-версии на aiogram -> MAX Bot API, raw-реализация на aiohttp)
-
-Работает на bothost.ru (Max Bot, Python).
-Переменные окружения: MAX_BOT_TOKEN (или MAX_TOKEN) — токен бота.
 """
 import asyncio
 import logging
@@ -38,12 +34,11 @@ MANAGER_USERNAME = "https://max.ru/u/f9LHodD0cOIIewxP4aChMb6ZLuuMWIITz-zSiBLo97J
 MANAGER_CHAT_ID = 313053726
 ADMIN_IDS = {313053726}
 
-# Ссылка на полную оферту (Яндекс.Диск)
 OFFER_PDF_URL = "https://disk.yandex.ru/i/YWhP_Tsg3c2Mxw"
 
 DB_PATH = os.getenv("DB_PATH", "data/shop.db")
 
-TZ_YANAO = timezone(timedelta(hours=5))  # ЯНАО = UTC+5
+TZ_YANAO = timezone(timedelta(hours=5))
 
 STATUS_LABELS = {
     "new": "🆕 Новый",
@@ -105,8 +100,7 @@ OFFER_FULL_TEXT = (
 
 WELCOME_MENU_TEXT = "Добро пожаловать! Выберите категорию:"
 
-# ================= СОСТОЯНИЯ (FSM в памяти) =================
-# state: {user_id: {"state": str|None, "data": dict}}
+# ================= СОСТОЯНИЯ =================
 user_states = {}
 
 def st_get(user_id):
@@ -335,7 +329,6 @@ class MaxApi:
                     if resp.status >= 400:
                         code = (data or {}).get("code", "")
                         message = (data or {}).get("message", "")
-                        # повторные попытки при обработке вложений платформой
                         if code in ("attachment.not.ready", "upload.error"):
                             await asyncio.sleep(2)
                             continue
@@ -380,7 +373,6 @@ class MaxApi:
         return data
 
     async def send_to_user(self, user_id, text, attachments=None):
-        # в диалоге chat_id == user_id
         return await self.send(user_id, text, attachments)
 
     async def edit(self, chat_id, message_id, text, attachments=None):
@@ -394,7 +386,6 @@ class MaxApi:
 api = MaxApi(BOT_TOKEN)
 
 def kb(buttons):
-    """Собирает inline_keyboard из списка строк кнопок."""
     return {"type": "inline_keyboard",
             "payload": {"buttons": buttons}}
 
@@ -405,6 +396,7 @@ def link_btn(text, url):
     return {"type": "link", "text": text, "url": url}
 
 def photo_attachment(token):
+    # В MAX API для отправки картинки по токену нужно передавать полный объект
     return {"type": "image", "payload": {"token": token}}
 
 # ================= КЛАВИАТУРЫ =================
@@ -533,7 +525,6 @@ async def handle_message(message):
     state = st_get(user_id)
     sname = state.get("state")
 
-    # --- админ/менеджер команды
     if text.startswith("/manager"):
         if is_manager(user_id):
             await api.send(chat_id, "Панель менеджера:",
@@ -552,7 +543,6 @@ async def handle_message(message):
         st_clear(user_id)
         return
 
-    # --- FSM: админ добавляет блюдо
     if sname == "admin_add_key" and text:
         key = text.lower().replace(" ", "_")
         if not key or not key.isascii():
@@ -616,7 +606,6 @@ async def handle_message(message):
                        attachments=[admin_panel_keyboard()])
         return
 
-    # --- FSM: админ редактирует поле
     if sname == "admin_edit_value":
         data = st_data(user_id)
         key, field = data.get("key"), data.get("field")
@@ -639,7 +628,6 @@ async def handle_message(message):
         await api.send(chat_id, "✅ Обновлено.", attachments=[admin_panel_keyboard()])
         return
 
-    # --- FSM: админ добавляет категорию
     if sname == "admin_cat_key" and text:
         key = text.lower().replace(" ", "_")
         if not key or not key.isascii():
@@ -660,7 +648,6 @@ async def handle_message(message):
                        attachments=[admin_panel_keyboard()])
         return
 
-    # --- FSM: оформление заказа
     if sname == "waiting_name":
         if not text or len(text) < 2:
             await api.send(chat_id, "Укажите имя (мин. 2 символа):")
@@ -701,7 +688,6 @@ async def handle_message(message):
         await finalize_order(chat_id, user_id, username)
         return
 
-    # --- команды без FSM
     if text.startswith("/offer"):
         await api.send(chat_id, OFFER_FULL_TEXT,
                        attachments=[kb([[link_btn("📄 Открыть PDF", OFFER_PDF_URL)]])])
@@ -724,7 +710,6 @@ async def handle_message(message):
             await send_menu(chat_id)
         return
 
-    # просто текст без команды — подсказка
     if not sname:
         user = await get_user(user_id)
         if user and user["agreed_offer"]:
@@ -826,7 +811,6 @@ async def handle_callback(update):
     if not user_id or chat_id is None:
         return
 
-    # --- оферта
     if payload == "offer_full":
         await ack()
         await api.send(chat_id, OFFER_FULL_TEXT,
@@ -846,13 +830,11 @@ async def handle_callback(update):
             await ack("Сначала прочитайте оферту: /start")
         return
 
-    # всё остальное — только для согласившихся
     user = await get_user(user_id)
     if not user or user["agreed_offer"] == 0:
         await ack("Сначала согласитесь с офертой: /start")
         return
 
-    # --- категории и меню
     if payload.startswith("cat:"):
         cat_key = payload.split(":")[1]
         items = await menu_all(category_key=cat_key)
@@ -894,7 +876,6 @@ async def handle_callback(update):
         await ack(f"✅ {item['name']} добавлен в корзину!")
         return
 
-    # --- корзина
     if payload == "cart":
         await ack()
         text, kbd_ = await cart_text_and_keyboard(user_id)
@@ -922,7 +903,6 @@ async def handle_callback(update):
         await api.send(chat_id, text, attachments=[kbd_])
         return
 
-    # --- оформление
     if payload == "order":
         rows = await cart_get(user_id)
         if not rows:
@@ -970,18 +950,15 @@ async def handle_callback(update):
         data["comment"] = "—"
         st_set(user_id, "waiting_comment", **data)
         await ack()
-        await finalize_order(chat_id, user_id, user.get("username") if False else
-                             (cb.get("user") or {}).get("username"))
+        await finalize_order(chat_id, user_id, user.get("username"))
         return
 
-    # --- админ: отмена сценария
     if payload == "admin_cancel":
         st_clear(user_id)
         await ack()
         await api.send(chat_id, "Отменено.", attachments=[admin_panel_keyboard()])
         return
 
-    # --- админ: добавление блюда
     if payload == "admin:add" and is_admin(user_id):
         st_set(user_id, "admin_add_key")
         await ack()
@@ -1070,7 +1047,6 @@ async def handle_callback(update):
         await api.send(chat_id, f"🗑 Блюдо {key} удалено.")
         return
 
-    # --- менеджер
     if payload.startswith("mgr:") and is_manager(user_id):
         status = payload.split(":")[1]
         orders = await orders_by_status(status, limit=10)
