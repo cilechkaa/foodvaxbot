@@ -1,22 +1,14 @@
-# Корневые сертификаты для HTTPS внутри контейнера
-import ssl
-try:
-    import certifi
-    _orig_ctx = ssl.create_default_context
-    def _patched_ctx(*args, **kwargs):
-        kwargs.pop("cafile", None)
-        return _orig_ctx(cafile=certifi.where())
-    ssl.create_default_context = _patched_ctx
-except ImportError:
-    pass
-
 # -*- coding: utf-8 -*-
 """
 КОТЛЕТЫ И СТЕЙК 89 — бот для мессенджера MAX
+Long polling на aiohttp, база SQLite (aiosqlite).
+Переменные окружения: MAX_BOT_TOKEN (или MAX_TOKEN) — токен бота.
 """
 import asyncio
 import logging
 import os
+import ssl
+import certifi
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -38,7 +30,7 @@ OFFER_PDF_URL = "https://disk.yandex.ru/i/YWhP_Tsg3c2Mxw"
 
 DB_PATH = os.getenv("DB_PATH", "data/shop.db")
 
-TZ_YANAO = timezone(timedelta(hours=5))
+TZ_YANAO = timezone(timedelta(hours=5))  # ЯНАО = UTC+5
 
 STATUS_LABELS = {
     "new": "🆕 Новый",
@@ -100,7 +92,7 @@ OFFER_FULL_TEXT = (
 
 WELCOME_MENU_TEXT = "Добро пожаловать! Выберите категорию:"
 
-# ================= СОСТОЯНИЯ =================
+# ================= СОСТОЯНИЯ (FSM в памяти) =================
 user_states = {}
 
 def st_get(user_id):
@@ -304,9 +296,12 @@ class MaxApi:
         self.send_locks = {}
 
     async def start(self):
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        log.info("SSL: использую сертификаты certifi (%s)", certifi.where())
         self.session = aiohttp.ClientSession(
             headers={"Authorization": self.token},
-            timeout=aiohttp.ClientTimeout(total=120))
+            timeout=aiohttp.ClientTimeout(total=120),
+            connector=aiohttp.TCPConnector(ssl=ctx))
 
     async def stop(self):
         if self.session:
@@ -396,7 +391,6 @@ def link_btn(text, url):
     return {"type": "link", "text": text, "url": url}
 
 def photo_attachment(token):
-    # В MAX API для отправки картинки по токену нужно передавать полный объект
     return {"type": "image", "payload": {"token": token}}
 
 # ================= КЛАВИАТУРЫ =================
@@ -782,8 +776,7 @@ async def finalize_order(chat_id, user_id, username):
         f"Напишите кассиру номер заказа (**#{order_id}**) и оплатите по СБП "
         f"на +7 996 655-26-90. Кнопка ниже — чат с кассиром."
     )
-    buttons = [[link_btn("💬 Написать кассиру",
-                         f"https://max.ru/u/f9LHodD0cOIIewxP4aChMb6ZLuuMWIITz-zSiBLo97JIL3CrV_li1dpy81g")]]
+    buttons = [[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]]
     await api.send(chat_id, user_text, attachments=[kb(buttons)])
 
     if not manager_sent:
