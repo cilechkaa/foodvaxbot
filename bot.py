@@ -1,3 +1,15 @@
+# Корневые сертификаты для HTTPS внутри контейнера
+import ssl
+try:
+    import certifi
+    _orig_ctx = ssl.create_default_context
+    def _patched_ctx(*args, **kwargs):
+        kwargs.pop("cafile", None)
+        return _orig_ctx(cafile=certifi.where())
+    ssl.create_default_context = _patched_ctx
+except ImportError:
+    pass
+
 # -*- coding: utf-8 -*-
 """
 КОТЛЕТЫ И СТЕЙК 89 — бот для мессенджера MAX
