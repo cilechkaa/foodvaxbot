@@ -1,3 +1,6 @@
 maxapi
 aiosqlite
 openpyxl
+aiohttp
+aiosqlite
+certifi
