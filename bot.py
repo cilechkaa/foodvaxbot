@@ -295,13 +295,16 @@ class MaxApi:
         self.session = None
         self.send_locks = {}
 
-    async def start(self):
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        log.info("SSL: использую сертификаты certifi (%s)", certifi.where())
+        async def start(self):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        log.info("SSL: строгая проверка сертификата отключена")
         self.session = aiohttp.ClientSession(
             headers={"Authorization": self.token},
             timeout=aiohttp.ClientTimeout(total=120),
             connector=aiohttp.TCPConnector(ssl=ctx))
+
 
     async def stop(self):
         if self.session:
