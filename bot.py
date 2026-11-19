@@ -295,7 +295,7 @@ class MaxApi:
         self.session = None
         self.send_locks = {}
 
-        async def start(self):
+    async def start(self):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -304,7 +304,6 @@ class MaxApi:
             headers={"Authorization": self.token},
             timeout=aiohttp.ClientTimeout(total=120),
             connector=aiohttp.TCPConnector(ssl=ctx))
-
 
     async def stop(self):
         if self.session:
