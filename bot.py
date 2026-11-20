@@ -9,10 +9,13 @@ import logging
 import os
 import ssl
 import sqlite3
+import io
+import re
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import aiosqlite
+from openpyxl import load_workbook
 from decimal import Decimal, InvalidOperation
 
 logging.basicConfig(level=logging.INFO,
@@ -693,12 +696,13 @@ def admin_panel_keyboard():
     return kb([
         [cb_btn("➕ Добавить блюдо", "admin:add"),
          cb_btn("📋 Все блюда", "admin:list")],
-        [cb_btn("🗂 Категории", "admin:cats"),
-         cb_btn("🗑 Удалить категорию", "admin:cat_del")],
+        [cb_btn("🗂 Список категорий", "admin:cats"),
+         cb_btn("➕ Добавить категорию", "admin:cat_add")],
+        [cb_btn("🗑 Удалить категорию", "admin:cat_del")],
         [cb_btn("📦 Остатки / стоп-лист", "admin:stock")],
         [cb_btn("📈 Топ продаж", "admin:stats")],
         [cb_btn("🖼 Загрузить QR-код", "admin:qr"),
-         cb_btn("📊 Загрузить меню списком", "admin:excel")],
+         cb_btn("📊 Загрузить меню Excel", "admin:excel")],
         [cb_btn("💾 Резервная копия БД", "admin:backup")],
     ])
 
@@ -758,6 +762,77 @@ async def cart_text_and_keyboard(user_id):
     kb_buttons.append([cb_btn("✅ Оформить заказ", "order")])
     kb_buttons.append([cb_btn("🗑 Очистить корзину", "main_menu")])
     return text, kb(kb_buttons)
+
+# ================= ИМПОРТ EXCEL =================
+def _excel_key(value, fallback):
+    raw = str(value or fallback).strip().lower()
+    raw = re.sub(r"[^a-z0-9_]+", "_", raw.replace(" ", "_"))
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    return raw or fallback
+
+async def import_menu_excel(file_bytes):
+    """Импорт XLSX. Колонки: key, name, description, price, category_key, category_name."""
+    workbook = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    sheet = workbook.active
+    rows = sheet.iter_rows(values_only=True)
+    first = next(rows, None)
+    if first is None:
+        workbook.close()
+        raise ValueError("В Excel нет строк")
+    aliases = {
+        "key": {"key", "ключ", "код", "артикул"},
+        "name": {"name", "название", "блюдо", "наименование"},
+        "description": {"description", "описание", "состав"},
+        "price": {"price", "цена", "стоимость"},
+        "category_key": {"category_key", "категория", "ключ категории", "категория ключ"},
+        "category_name": {"category_name", "название категории", "категория название"},
+    }
+    normalized = [str(v or "").strip().lower() for v in first]
+    header_map = {}
+    for idx, value in enumerate(normalized):
+        for field, names in aliases.items():
+            if value in names:
+                header_map[field] = idx
+    has_header = "name" in header_map and "price" in header_map
+    data_rows = rows if has_header else iter([first, *rows])
+    imported = skipped = 0
+    errors = []
+    for row_num, row in enumerate(data_rows, start=2 if has_header else 1):
+        if not row or not any(v is not None and str(v).strip() for v in row):
+            continue
+        try:
+            def val(field, pos, default=""):
+                if has_header:
+                    idx = header_map.get(field)
+                    if idx is None:
+                        return default
+                else:
+                    idx = pos
+                return row[idx] if idx < len(row) and row[idx] is not None else default
+            name = str(val("name", 1)).strip()
+            desc = str(val("description", 2)).strip()
+            price_raw = val("price", 3)
+            cat_raw = str(val("category_key", 4, "other")).strip() or "other"
+            cat_name = str(val("category_name", 5, "Прочее")).strip() or "Прочее"
+            key_raw = val("key", 0, "")
+            if not name or price_raw == "":
+                raise ValueError("нужно заполнить название и цену")
+            price = Decimal(str(price_raw).replace(" ", "").replace(",", "."))
+            if price <= 0:
+                raise ValueError("цена должна быть больше нуля")
+            key = _excel_key(key_raw, _excel_key(name, f"dish_{row_num}"))
+            cat_key = _excel_key(cat_raw, "default")
+            if cat_key == "default":
+                cat_key, cat_name = "other", "Прочее"
+            await category_add(cat_key, cat_name or cat_key,
+                               cat_name or cat_key)
+            await menu_add(key, name, desc, str(price), cat_key, None)
+            imported += 1
+        except Exception as exc:
+            skipped += 1
+            errors.append(f"Строка {row_num}: {exc}")
+    workbook.close()
+    return imported, skipped, errors
 
 # ================= ОБЩИЕ ЭКРАНЫ =================
 async def send_menu(chat_id):
@@ -821,6 +896,14 @@ async def handle_message(message):
             attachments=[kb([[link_btn("📄 Прочитать оферту", OFFER_PDF_URL)]])]
         )
         return
+
+    # До акцепта оферты обычные действия и просмотр меню недоступны.
+    if not is_admin(user_id):
+        current_user = await get_user(user_id)
+        if not current_user or not current_user["agreed_offer"]:
+            st_set(user_id, "waiting_offer")
+            await send_offer_screen(chat_id)
+            return
 
     if text.startswith("/manager"):
         if is_manager(user_id):
@@ -968,30 +1051,50 @@ async def handle_message(message):
             await api.send(chat_id, "Отправьте фото QR-кода:")
         return
 
-    # ===== Состояния админа: импорт меню списком =====
-    if sname == "admin_excel" and text:
+    # ===== Импорт меню из Excel =====
+    if sname == "admin_excel":
         if text.lower() in ("отмена", "cancel"):
             st_clear(user_id)
-            await api.send(chat_id, "Отменено.",
+            await api.send(chat_id, "Импорт отменён.",
                            attachments=[admin_panel_keyboard()])
             return
-        count = 0
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split(";")]
-            if len(parts) < 5 or not parts[0] or not parts[1]:
-                continue
-            key = parts[0].lower().replace(" ", "_")
-            name, desc, price, cat = parts[1], parts[2], parts[3], parts[4]
-            cat_display = parts[5] if len(parts) > 5 and parts[5] else None
-            await category_add(cat, cat, cat_display)
-            await menu_add(key, name, desc or "", price, cat, None)
-            count += 1
-        st_clear(user_id)
-        await api.send(chat_id, f"✅ Успешно загружено {count} блюд из списка!",
-                       attachments=[admin_panel_keyboard()])
+        file_attachments = [a for a in (body.get("attachments") or [])
+                            if a.get("type") == "file"]
+        if not file_attachments:
+            await api.send(chat_id,
+                           "Пришлите файл Excel формата .xlsx как документ. "
+                           "Для отмены напишите «отмена».")
+            return
+        payload_file = file_attachments[-1].get("payload") or {}
+        filename = (payload_file.get("filename") or "").lower()
+        file_url = payload_file.get("url")
+        if filename and not filename.endswith(".xlsx"):
+            await api.send(chat_id, "Нужен файл Excel именно в формате .xlsx.")
+            return
+        if not file_url:
+            await api.send(chat_id,
+                           "MAX не передал ссылку на файл. Попробуйте отправить "
+                           "Excel ещё раз как документ.")
+            return
+        try:
+            async with api.session.get(file_url, ssl=False) as response:
+                if response.status != 200:
+                    raise ValueError(f"HTTP {response.status}")
+                excel_bytes = await response.read()
+            if len(excel_bytes) > 15 * 1024 * 1024:
+                raise ValueError("Файл больше 15 МБ")
+            imported, skipped, errors = await import_menu_excel(excel_bytes)
+            st_clear(user_id)
+            result = (f"✅ Импорт завершён.\nДобавлено/обновлено блюд: {imported}.\n"
+                      f"Пропущено строк: {skipped}.")
+            if errors:
+                result += "\n\nПервые ошибки:\n" + "\n".join(errors[:8])
+            await api.send(chat_id, result, attachments=[admin_panel_keyboard()])
+        except Exception as exc:
+            log.exception("Ошибка импорта Excel")
+            await api.send(chat_id,
+                           f"Не удалось прочитать Excel: {exc}. Проверьте формат .xlsx "
+                           "и попробуйте снова.")
         return
 
     # ===== Оформление заказа: имя/телефон/адрес/время/комментарий =====
@@ -1626,7 +1729,11 @@ async def handle_callback(update):
         text = "Категории:\n" + "\n".join(
             f"• {c['key']} — {c['display_name'] or c['name']}" for c in cats)
         await ack()
-        await api.send(chat_id, text)
+        await api.send(chat_id, text, attachments=[kb([
+            [cb_btn("➕ Добавить категорию", "admin:cat_add")],
+            [cb_btn("🗑 Удалить категорию", "admin:cat_del")],
+            [cb_btn("⬅️ В админ-панель", "admin:back")],
+        ])])
         return
 
     if payload == "admin:cat_add" and is_admin(user_id):
@@ -1728,13 +1835,14 @@ async def handle_callback(update):
         st_set(user_id, "admin_excel")
         await ack()
         await api.send(chat_id,
-                       "Отправьте список блюд текстом — по одному блюду на строку, "
-                       "поля через точку с запятой:\n\n"
-                       "ключ; Название; Описание; Цена; категория; Название категории\n\n"
-                       "Пример строки:\n"
-                       "kotleta; Котлета по-киевски; 250 г, курица; 350; hot_dishes; "
-                       "Горячие блюда\n\n"
-                       "Категория и название категории создадутся автоматически.\n"
+                       "Пришлите Excel-файл .xlsx как документ.\n\n"
+                       "Столбцы в первой строке (заголовки):\n"
+                       "key | name | description | price | category_key | category_name\n\n"
+                       "Пример: kotleta | Котлета по-киевски | 250 г, курица | "
+                       "350 | hot_dishes | Горячие блюда\n\n"
+                       "Можно использовать русские заголовки: Ключ, Название, "
+                       "Описание, Цена, Категория, Название категории. "
+                       "Если категории ещё нет, она создастся автоматически.\n"
                        "Для отмены напишите: отмена")
         return
 
