@@ -238,11 +238,14 @@ async def categories_visible():
             return await cur.fetchall()
 
 async def category_add(key, name, display_name=None, sort_order=0):
+    """Создаёт категорию или обновляет её отображаемое название."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO categories (key, name, display_name, sort_order) VALUES (?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
-                display_name = COALESCE(excluded.display_name, categories.display_name)
+                name = excluded.name,
+                display_name = COALESCE(NULLIF(excluded.display_name, ''),
+                                        NULLIF(categories.display_name, ''), excluded.name)
         """, (key, name, display_name, sort_order))
         await db.commit()
 
@@ -771,68 +774,92 @@ def _excel_key(value, fallback):
     return raw or fallback
 
 async def import_menu_excel(file_bytes):
-    """Импорт XLSX. Колонки: key, name, description, price, category_key, category_name."""
+    """Импорт XLSX. Колонки: key, name, description, price, category_key, category_name.
+
+    category_key — стабильный латинский код категории (например, hot_dishes).
+    category_name — название, которое увидят клиенты (например, Горячие блюда).
+    Если category_name не заполнен, используем уже существующее название категории,
+    а если его нет — аккуратно формируем название из category_key.
+    """
     workbook = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-    sheet = workbook.active
-    rows = sheet.iter_rows(values_only=True)
-    first = next(rows, None)
-    if first is None:
-        workbook.close()
-        raise ValueError("В Excel нет строк")
-    aliases = {
-        "key": {"key", "ключ", "код", "артикул"},
-        "name": {"name", "название", "блюдо", "наименование"},
-        "description": {"description", "описание", "состав"},
-        "price": {"price", "цена", "стоимость"},
-        "category_key": {"category_key", "категория", "ключ категории", "категория ключ"},
-        "category_name": {"category_name", "название категории", "категория название"},
-    }
-    normalized = [str(v or "").strip().lower() for v in first]
-    header_map = {}
-    for idx, value in enumerate(normalized):
-        for field, names in aliases.items():
-            if value in names:
-                header_map[field] = idx
-    has_header = "name" in header_map and "price" in header_map
-    data_rows = rows if has_header else iter([first, *rows])
-    imported = skipped = 0
-    errors = []
-    for row_num, row in enumerate(data_rows, start=2 if has_header else 1):
-        if not row or not any(v is not None and str(v).strip() for v in row):
-            continue
-        try:
-            def val(field, pos, default=""):
-                if has_header:
+    try:
+        sheet = workbook.active
+        rows = sheet.iter_rows(values_only=True)
+        first = next(rows, None)
+        if first is None:
+            raise ValueError("В Excel нет строк")
+
+        aliases = {
+            "key": {"key", "ключ", "код", "артикул"},
+            "name": {"name", "название", "блюдо", "наименование"},
+            "description": {"description", "описание", "состав"},
+            "price": {"price", "цена", "стоимость"},
+            "category_key": {"category_key", "category key", "ключ категории", "категория ключ", "код категории"},
+            "category_name": {"category_name", "category name", "название категории", "категория название"},
+        }
+        normalized = [str(v or "").replace("\ufeff", "").strip().lower() for v in first]
+        header_map = {}
+        for idx, value in enumerate(normalized):
+            for field, names in aliases.items():
+                if value in names:
+                    header_map[field] = idx
+        has_header = "name" in header_map and "price" in header_map
+        if not has_header:
+            raise ValueError(
+                "Не найдены заголовки. Нужны столбцы: key, name, description, price, category_key, category_name"
+            )
+
+        imported = skipped = 0
+        errors = []
+        for row_num, row in enumerate(rows, start=2):
+            if not row or not any(v is not None and str(v).strip() for v in row):
+                continue
+            try:
+                def val(field, default=""):
                     idx = header_map.get(field)
-                    if idx is None:
+                    if idx is None or idx >= len(row) or row[idx] is None:
                         return default
+                    return row[idx]
+
+                name = str(val("name")).strip()
+                desc = str(val("description")).strip()
+                price_raw = val("price")
+                cat_raw = str(val("category_key", "other")).strip() or "other"
+                cat_name_raw = str(val("category_name", "")).strip()
+                key_raw = val("key", "")
+
+                if not name or price_raw == "":
+                    raise ValueError("нужно заполнить название и цену")
+                price = Decimal(str(price_raw).replace(" ", "").replace(",", "."))
+                if price <= 0:
+                    raise ValueError("цена должна быть больше нуля")
+
+                key = _excel_key(key_raw, _excel_key(name, f"dish_{row_num}"))
+                cat_key = _excel_key(cat_raw, "other")
+                if cat_key == "default":
+                    cat_key = "other"
+
+                if cat_name_raw:
+                    cat_name = cat_name_raw
                 else:
-                    idx = pos
-                return row[idx] if idx < len(row) and row[idx] is not None else default
-            name = str(val("name", 1)).strip()
-            desc = str(val("description", 2)).strip()
-            price_raw = val("price", 3)
-            cat_raw = str(val("category_key", 4, "other")).strip() or "other"
-            cat_name = str(val("category_name", 5, "Прочее")).strip() or "Прочее"
-            key_raw = val("key", 0, "")
-            if not name or price_raw == "":
-                raise ValueError("нужно заполнить название и цену")
-            price = Decimal(str(price_raw).replace(" ", "").replace(",", "."))
-            if price <= 0:
-                raise ValueError("цена должна быть больше нуля")
-            key = _excel_key(key_raw, _excel_key(name, f"dish_{row_num}"))
-            cat_key = _excel_key(cat_raw, "default")
-            if cat_key == "default":
-                cat_key, cat_name = "other", "Прочее"
-            await category_add(cat_key, cat_name or cat_key,
-                               cat_name or cat_key)
-            await menu_add(key, name, desc, str(price), cat_key, None)
-            imported += 1
-        except Exception as exc:
-            skipped += 1
-            errors.append(f"Строка {row_num}: {exc}")
-    workbook.close()
-    return imported, skipped, errors
+                    # Не затираем уже заведённое вручную название категории.
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        async with db.execute(
+                            "SELECT display_name, name FROM categories WHERE key = ?", (cat_key,)
+                        ) as cur:
+                            existing = await cur.fetchone()
+                    existing_name = (existing[0] or existing[1]) if existing else None
+                    cat_name = existing_name or cat_key.replace("_", " ").capitalize()
+
+                await category_add(cat_key, cat_name, cat_name)
+                await menu_add(key, name, desc, str(price), cat_key, None)
+                imported += 1
+            except Exception as exc:
+                skipped += 1
+                errors.append(f"Строка {row_num}: {exc}")
+        return imported, skipped, errors
+    finally:
+        workbook.close()
 
 # ================= ОБЩИЕ ЭКРАНЫ =================
 async def send_menu(chat_id):
