@@ -46,56 +46,6 @@ STATUS_LABELS = {
     "cancelled": "❌ Отменён",
 }
 
-OFFER_TEXT = (
-    "📜 **Публичная оферта**\n\n"
-    "Для оформления заказа необходимо согласиться с условиями публичной оферты "
-    "и обработкой персональных данных (имя, телефон, адрес).\n\n"
-    "Кратко о главном:\n"
-    "• Оплата — СБП, переводом по реквизитам или наличными при получении.\n"
-    "• Отмена заказа — бесплатно до передачи товара курьеру.\n"
-    "• Возврат за брак — в течение 10 дней, деньги тем же способом.\n"
-    "• Дистанционная покупка — отказ в течение 7 дней после получения.\n"
-    "• Персональные данные используются только для доставки (152-ФЗ), "
-    "отзыв согласия — ZEVSNAB@yandex.ru.\n\n"
-    "Полный текст оферты — по кнопке ниже или командой /offer в чате."
-)
-
-OFFER_FULL_TEXT = (
-    "📜 **Публичная оферта — Котлеты и Стейк 89**\n\n"
-    "**1. Общие положения.** Настоящая оферта является публичным договором "
-    "(ст. 435, 437 ГК РФ). Акцепт — оформление заказа у бота.\n\n"
-    "**2. Исполнитель.** ИП Зиньковский Евгений Викторович, ИНН 890603958650, "
-    "ОГРНИП 325890000000641, ЯНАО, г. Муравленко. "
-    "Тел: +7 996 655-26-90, e-mail: ZEVSNAB@yandex.ru.\n\n"
-    "**3. Товар и цена.** Блюда по меню бота (Приложение № 1 к оферте). "
-    "Цена указана за порцию и подтверждается при подтверждении заказа.\n\n"
-    "**4. Заказ.** Заказ оформляется через бота: состав корзины + данные "
-    "доставки (имя, телефон, адрес).\n\n"
-    "**5. Доставка.** Доставка по г. Муравленко. Способ и время согласуются "
-    "с кассиром.\n\n"
-    "**6. Оплата.** СБП на номер +7 996 655-26-90, перевод по реквизитам "
-    "(ООО «ОЗОН Банк», р/с 40802810600000705166) или наличными при получении. "
-    "К каждому заказу прилагается кассовый чек.\n\n"
-    "**7. Отмена заказа и возвраты.**\n"
-    "7.1. Клиент может отменить заказ бесплатно до передачи товара курьеру — "
-    "написав в чат бота или позвонив +7 996 655-26-90.\n"
-    "7.2. При дистанционной покупке (ст. 26.1 Закона «О защите прав "
-    "потребителей») клиент вправе отказаться от товара в течение 7 дней "
-    "после получения, если сохранены потребительские свойства и товарный вид.\n"
-    "7.3. При претензии к качеству (брак, несоответствие заказу) — замена "
-    "товара, уменьшение цены или полный возврат средств в течение 10 дней.\n"
-    "7.4. Деньги возвращаются тем же способом, которым была произведена "
-    "оплата (СБП — на карту отправителя, наличные — наличными).\n"
-    "7.5. Если клиент не принял заказ по своей вине (не отвечает, нет "
-    "адреса), расходы исполнителя на доставку не возвращаются.\n\n"
-    "**8. Претензии.** Телефон +7 996 655-26-90, ZEVSNAB@yandex.ru, "
-    "личные сообщения канала или бота.\n\n"
-    "**9. Персональные данные.** Данные (имя, телефон, адрес) обрабатываются "
-    "только для исполнения заказа (152-ФЗ). Отзыв согласия: "
-    "ZEVSNAB@yandex.ru. Данные хранятся не дольше, чем это необходимо.\n\n"
-    "**10. Защита прав.** Клиент вправе обратиться в Роспотребнадзор или в суд.\n"
-)
-
 GARNISH_CATEGORIES = {"hot_dishes", "schnitzels", "steaks"}
 GARNISH_LABELS = {"fries": "🍟 Картофель фри", "rice": "🍚 Отварной рис"}
 
@@ -820,13 +770,19 @@ async def send_menu(chat_id):
 def offer_keyboard():
     return kb([
         [link_btn("📄 Прочитать оферту", OFFER_PDF_URL)],
-        [cb_btn("📜 Оферта в чате", "offer_full")],
         [cb_btn("✅ Согласен", "agree_offer"),
          cb_btn("❌ Не согласен", "disagree_offer")],
     ])
 
+
 async def send_offer_screen(chat_id):
-    await api.send(chat_id, OFFER_TEXT, attachments=[offer_keyboard()])
+    await api.send(
+        chat_id,
+        "Для продолжения работы с ботом ознакомьтесь с публичной офертой "
+        "по кнопке «Прочитать оферту» и выберите «Согласен».",
+        attachments=[offer_keyboard()]
+    )
+
 
 # ================= ОБРАБОТКА СООБЩЕНИЙ =================
 async def handle_message(message):
@@ -859,8 +815,11 @@ async def handle_message(message):
         return
 
     if text.startswith("/offer"):
-        await api.send(chat_id, OFFER_FULL_TEXT,
-                       attachments=[kb([[link_btn("📄 Открыть PDF", OFFER_PDF_URL)]])])
+        await api.send(
+            chat_id,
+            "Полный текст публичной оферты доступен по ссылке:",
+            attachments=[kb([[link_btn("📄 Прочитать оферту", OFFER_PDF_URL)]])]
+        )
         return
 
     if text.startswith("/manager"):
@@ -1278,16 +1237,21 @@ async def finalize_order(chat_id, user_id, username):
 
 # ================= ОБРАБОТКА CALLBACK =================
 async def handle_callback(update):
-    cb = (update.get("callback") or {})
-    callback_id = cb.get("callback_id")
-    payload = cb.get("payload", "")
+    cb = update.get("callback") or {}
+    callback_id = cb.get("callback_id") or update.get("callback_id")
+
+    # Поддерживаем варианты структуры callback-событий MAX.
+    payload = cb.get("payload")
+    if payload is None:
+        payload = cb.get("data", update.get("payload", ""))
     if not isinstance(payload, str):
         payload = str(payload)
-    user = (cb.get("user") or {})
+
+    user = cb.get("user") or update.get("user") or {}
     user_id = user.get("user_id")
-    msg = (cb.get("message") or {})
-    chat_id = ((msg.get("recipient") or {}).get("chat_id")) or user_id
-    message_id = msg.get("body", {}).get("mid") or msg.get("mid")
+    msg = cb.get("message") or update.get("message") or {}
+    recipient = msg.get("recipient") or {}
+    chat_id = recipient.get("chat_id") or update.get("chat_id") or user_id
 
     log.info("Callback: payload=%r user=%s chat=%s", payload, user_id, chat_id)
 
@@ -1296,29 +1260,26 @@ async def handle_callback(update):
             await api.answer_callback(callback_id, notification)
 
     if not user_id or chat_id is None:
-        return
-
-    if payload == "offer_full":
-        await ack()
-        await api.send(chat_id, OFFER_FULL_TEXT,
-                       attachments=[kb([[link_btn("📄 Открыть PDF", OFFER_PDF_URL)],
-                                        [cb_btn("✅ Согласен", "agree_offer"),
-                                         cb_btn("❌ Не согласен", "disagree_offer")]])])
+        log.warning("Callback без user_id/chat_id: %r", update)
+        await ack("Не удалось определить пользователя. Напишите /start.")
         return
 
     if payload == "agree_offer":
         await set_agreed(user_id)
         st_clear(user_id)
-        await ack()
+        await ack("Спасибо! Согласие принято.")
         log.info("Пользователь %s согласился с офертой", user_id)
-        await api.send(chat_id, "МЕНЮ")
         await send_menu(chat_id)
         return
 
     if payload == "disagree_offer":
-        await ack()
-        await api.send(chat_id, "К сожалению, мы не можем оказать услугу, "
-                                "так как вы отказались от условий оферты.")
+        st_clear(user_id)
+        await ack("Вы отказались от условий оферты.")
+        await api.send(
+            chat_id,
+            "Без согласия с офертой оформление заказов недоступно. "
+            "Если передумаете, нажмите /start."
+        )
         return
 
     user = await get_user(user_id)
@@ -1939,13 +1900,18 @@ async def poll_loop():
                     await handle_callback(update)
                 elif ut == "bot_started":
                     chat_id = update.get("chat_id")
-                    user_id = ((update.get("user") or {}).get("user_id"))
+                    user_id = (update.get("user") or {}).get("user_id")
                     if chat_id is None:
                         chat_id = user_id
                     if chat_id is not None:
-                        await send_offer_screen(chat_id)
-                        if user_id:
-                            st_set(user_id, "waiting_offer")
+                        existing_user = await get_user(user_id) if user_id else None
+                        if existing_user and existing_user["agreed_offer"]:
+                            st_clear(user_id)
+                            await send_menu(chat_id)
+                        else:
+                            await send_offer_screen(chat_id)
+                            if user_id:
+                                st_set(user_id, "waiting_offer")
             except Exception:
                 log.exception("Ошибка обработки обновления: %s", ut)
 
