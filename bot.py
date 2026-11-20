@@ -42,7 +42,8 @@ DB_PATH = os.getenv("DB_PATH", "data/shop.db")
 TZ_YANAO = timezone(timedelta(hours=5))  # ЯНАО = UTC+5
 
 STATUS_LABELS = {
-    "new": "🆕 Новый",
+    "new": "🆕 Ожидает оплаты",
+    "paid": "💳 Оплата подтверждена клиентом",
     "cooking": "👨‍🍳 Готовится",
     "delivering": "🛵 В доставке",
     "done": "✅ Доставлен",
@@ -680,6 +681,7 @@ def garnish_keyboard(item_key):
 def manager_keyboard(order_id, status):
     transitions = {
         "new": [("👨‍🍳 Готовится", "cooking"), ("❌ Отменить", "cancelled")],
+        "paid": [("👨‍🍳 Готовится", "cooking"), ("❌ Отменить", "cancelled")],
         "cooking": [("🛵 В доставке", "delivering"), ("❌ Отменить", "cancelled")],
         "delivering": [("✅ Доставлен", "done"), ("❌ Отменить", "cancelled")],
         "done": [], "cancelled": [],
@@ -690,7 +692,8 @@ def manager_keyboard(order_id, status):
 
 def manager_panel_keyboard():
     return kb([
-        [cb_btn("🆕 Новые заказы", "mgr:new")],
+        [cb_btn("🆕 Ожидают оплаты", "mgr:new")],
+        [cb_btn("💳 Клиент сообщил об оплате", "mgr:paid")],
         [cb_btn("👨‍🍳 Готовятся", "mgr:cooking")],
         [cb_btn("🛵 В доставке", "mgr:delivering")],
         [cb_btn("✅ Доставленные", "mgr:done")],
@@ -1347,14 +1350,25 @@ async def finalize_order(chat_id, user_id, username):
 
     qr_token = await get_setting("payment_qr")
     if qr_token:
-        try:
+        qr_sent = await api.send(
+            chat_id,
+            f"💳 **Оплата заказа #{order_id}**\n"
+            f"Сумма: **{final_total} ₽**\n\n"
+            "Отсканируйте QR-код и оплатите заказ. После оплаты нажмите «Я оплатил».",
+            attachments=[photo_attachment(qr_token),
+                         kb([[cb_btn("✅ Я оплатил", f"paid:{order_id}")]])])
+        if qr_sent is None:
+            log.error("Не удалось отправить QR-код клиенту для заказа #%s", order_id)
             await api.send(chat_id,
-                           f"💳 **Оплата заказа #{order_id}**\n"
-                           f"Сумма: **{final_total} ₽**\n\n"
-                           f"Отсканируйте QR-код для оплаты.",
-                           attachments=[photo_attachment(qr_token)])
-        except Exception:
-            pass
+                           "⚠️ Не удалось отправить QR-код. Напишите кассиру, "
+                           "чтобы получить реквизиты для оплаты.",
+                           attachments=[kb([[cb_btn("💬 Написать кассиру", "contact_manager")]])])
+    else:
+        log.error("Не задан payment_qr: заказ #%s оформлен без QR-кода", order_id)
+        await api.send(chat_id,
+                       "⚠️ QR-код для оплаты пока не настроен. Напишите кассиру, "
+                       "чтобы получить реквизиты для оплаты.",
+                       attachments=[kb([[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
 
     if not manager_sent:
         await api.send_to_user(
@@ -1378,8 +1392,9 @@ async def handle_callback(update):
     if not isinstance(payload, str):
         payload = str(payload)
 
-    user = cb.get("user") or update.get("user") or {}
-    user_id = user.get("user_id")
+    callback_user = cb.get("user") or update.get("user") or {}
+    user_id = callback_user.get("user_id")
+    callback_username = callback_user.get("username")
     msg = cb.get("message") or update.get("message") or {}
     recipient = msg.get("recipient") or {}
     chat_id = recipient.get("chat_id") or update.get("chat_id") or user_id
@@ -1715,7 +1730,45 @@ async def handle_callback(update):
         data["comment"] = "—"
         st_set(user_id, "waiting_comment", **data)
         await ack()
-        await finalize_order(chat_id, user_id, user.get("username"))
+        await finalize_order(chat_id, user_id, callback_username)
+        return
+
+    if payload == "contact_manager":
+        await ack("Открываю контакт кассира")
+        await api.send(chat_id, "Свяжитесь с кассиром:",
+                       attachments=[kb([[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
+        return
+
+    if payload.startswith("paid:"):
+        try:
+            order_id = int(payload.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await ack("Некорректный номер заказа")
+            return
+        order = await order_get(order_id)
+        if not order or order["user_id"] != user_id:
+            await ack("Заказ не найден")
+            return
+        if order["status"] == "cancelled":
+            await ack("Заказ отменён. Свяжитесь с кассиром.")
+            return
+        if order["status"] in ("paid", "cooking", "delivering", "done"):
+            await ack("Оплата уже отмечена")
+            return
+        await order_set_status(order_id, "paid")
+        await ack("Спасибо! Сообщение об оплате отправлено кассиру.")
+        await api.send(chat_id,
+                       f"💳 Вы сообщили об оплате заказа **#{order_id}**.\n"
+                       "Статус: **Оплата ожидает проверки кассиром**.\n"
+                       "После проверки кассир обновит статус заказа, и бот сообщит вам.")
+        manager_order_text = (
+            f"💳 Клиент сообщил об оплате заказа #{order_id}.\n"
+            f"Клиент: {order['name']} (@{order['username']}, ID: {order['user_id']})\n"
+            f"Сумма: {order['total']} ₽\n\n"
+            "Проверьте поступление оплаты и переведите заказ в приготовление."
+        )
+        await api.send_to_user(MANAGER_CHAT_ID, manager_order_text,
+                               attachments=[manager_keyboard(order_id, "paid")])
         return
 
     # ===== Админ-панель =====
@@ -1993,6 +2046,7 @@ async def handle_callback(update):
         await api.send(chat_id, new_text,
                        attachments=[manager_keyboard(order_id, new_status)])
         notify_texts = {
+            "paid": "💳 Кассир отметил оплату заказа #{}.",
             "cooking": "👨‍🍳 Ваш заказ #{} уже готовится!",
             "delivering": "🛵 Ваш заказ #{} уже везёт курьер!",
             "done": "✅ Заказ #{} доставлен. Приятного аппетита!",
