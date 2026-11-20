@@ -558,9 +558,10 @@ class MaxApi:
         return await self._request("GET", "/updates", params=params)
 
     async def answer_callback(self, callback_id, notification=None):
-        body = {}
-        if notification:
-            body = {"notification": notification}
+        # MAX требует непустое поле message или notification даже для тихого ack.
+        # Пробел используется как нейтральное уведомление, чтобы не показывать
+        # пользователю лишний текст при обычном нажатии кнопки.
+        body = {"notification": str(notification) if notification else " "}
         await self._request("POST", "/answers", params={"callback_id": callback_id},
                             json_body=body)
 
@@ -652,7 +653,7 @@ def item_label(item):
 def menu_keyboard(items, cat_key):
     buttons = [[cb_btn(item_label(i), f"view:{i['key']}")] for i in items]
     buttons.append([cb_btn("⬅️ Назад", "back_categories")])
-    buttons.append([cb_btn("🗑 Очистить корзину", "main_menu")])
+    buttons.append([cb_btn("🏠 Главное меню", "main_menu")])
     buttons.append([cb_btn("🛒 Корзина", "cart")])
     return kb(buttons)
 
@@ -663,7 +664,7 @@ async def item_card_keyboard(user_id, item_key, cat_key):
         [cb_btn("🛒 Добавить в корзину", f"add:{item_key}")],
         [cb_btn(fav_label, f"fav:{item_key}")],
         [cb_btn("⬅️ Назад", f"cat:{cat_key}")],
-        [cb_btn("🗑 Очистить корзину", "main_menu")],
+        [cb_btn("🏠 Главное меню", "main_menu")],
         [cb_btn("🛒 Корзина", "cart")],
     ])
 
@@ -672,7 +673,7 @@ def garnish_keyboard(item_key):
         [cb_btn("🍟 Картофель фри", f"garnish:{item_key}:fries")],
         [cb_btn("🍚 Отварной рис", f"garnish:{item_key}:rice")],
         [cb_btn("⬅️ Назад", f"cat_back:{item_key}")],
-        [cb_btn("🗑 Очистить корзину", "main_menu")],
+        [cb_btn("🏠 Главное меню", "main_menu")],
         [cb_btn("🛒 Корзина", "cart")],
     ])
 
@@ -725,7 +726,7 @@ def admin_item_keyboard(key, active):
 async def cart_text_and_keyboard(user_id):
     rows = await cart_get(user_id)
     if not rows:
-        return "Корзина пуста.", kb([[cb_btn("🗑 Очистить корзину", "main_menu")]])
+        return "Корзина пуста.", kb([[cb_btn("🏠 Главное меню", "main_menu")]])
 
     lines, kb_buttons = [], []
     total = Decimal("0")
@@ -763,7 +764,7 @@ async def cart_text_and_keyboard(user_id):
     kb_buttons.append([cb_btn("📞 Мой телефон", "edit_phone"),
                        cb_btn("📍 Мой адрес", "edit_address")])
     kb_buttons.append([cb_btn("✅ Оформить заказ", "order")])
-    kb_buttons.append([cb_btn("🗑 Очистить корзину", "main_menu")])
+    kb_buttons.append([cb_btn("🏠 Главное меню", "main_menu")])
     return text, kb(kb_buttons)
 
 # ================= ИМПОРТ EXCEL =================
@@ -1418,9 +1419,8 @@ async def handle_callback(update):
         return
 
     if payload == "main_menu":
+        # Переход в меню не должен удалять уже выбранные товары.
         st_clear(user_id)
-        await cart_clear(user_id)
-        await clear_garnishes(user_id)
         await ack()
         await send_menu(chat_id)
         return
