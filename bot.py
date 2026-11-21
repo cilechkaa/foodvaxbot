@@ -2,7 +2,9 @@
 """
 КОТЛЕТЫ И СТЕЙК 89 — бот для мессенджера MAX
 Long polling на aiohttp, база SQLite (aiosqlite).
-Переменные окружения: MAX_BOT_TOKEN (или MAX_TOKEN) — токен бота.
+Переменные окружения: MAX_BOT_TOKEN (или MAX_TOKEN) — токен бота;
+MANAGER_CHAT_ID — числовой ID кассира (можно задать в админ-панели);
+ADMIN_IDS — ID администраторов через запятую.
 """
 import asyncio
 import logging
@@ -26,8 +28,17 @@ log = logging.getLogger("kotleta89")
 BOT_TOKEN = os.getenv("MAX_BOT_TOKEN") or os.getenv("MAX_TOKEN") or "ВСТАВЬ_ТОКЕН"
 API_BASE = "https://platform-api2.max.ru"
 MANAGER_USERNAME = "https://max.ru/u/f9LHodD0cOIIewxP4aChMb6ZLuuMWIITz-zSiBLo97JIL3CrV_li1dpy81g"
-MANAGER_CHAT_ID = 313053726
-ADMIN_IDS = {313053726}
+MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "313053726"))
+
+def _parse_ids(raw):
+    result = set()
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            result.add(int(part))
+    return result
+
+ADMIN_IDS = _parse_ids(os.getenv("ADMIN_IDS", "313053726")) or {313053726}
 
 OFFER_PDF_URL = "https://disk.yandex.ru/i/YWhP_Tsg3c2Mxw"
 
@@ -157,6 +168,11 @@ async def init_db():
             VALUES ('default', 'Меню', 'Меню', 0)
         """)
         await db.commit()
+        async with db.execute("SELECT value FROM settings WHERE key = 'manager_chat_id'") as cur:
+            manager_row = await cur.fetchone()
+        if manager_row and str(manager_row[0]).isdigit():
+            global MANAGER_CHAT_ID
+            MANAGER_CHAT_ID = int(manager_row[0])
 
 # ================= ПОЛЬЗОВАТЕЛИ И НАСТРОЙКИ =================
 async def get_user(user_id: int):
@@ -586,6 +602,25 @@ class MaxApi:
     async def send_to_user(self, user_id, text, attachments=None):
         return await self.send(user_id, text, attachments)
 
+    async def notify_staff(self, text, attachments=None):
+        """Дублирует служебное уведомление кассиру и всем администраторам."""
+        recipients = set(ADMIN_IDS)
+        if MANAGER_CHAT_ID:
+            recipients.add(int(MANAGER_CHAT_ID))
+        results = {}
+        for recipient_id in sorted(recipients):
+            try:
+                result = await self.send_to_user(recipient_id, text, attachments)
+                results[recipient_id] = result is not None
+                if result is None:
+                    log.error("Уведомление сотруднику не доставлено: user_id=%s. "
+                              "Проверьте, что пользователь открыл чат с ботом (/start).",
+                              recipient_id)
+            except Exception:
+                log.exception("Ошибка уведомления сотрудника user_id=%s", recipient_id)
+                results[recipient_id] = False
+        return any(results.values())
+
     async def edit(self, chat_id, message_id, text, attachments=None):
         body = {"text": text or " ", "format": "markdown"}
         if attachments is not None:
@@ -706,6 +741,7 @@ def admin_panel_keyboard():
         [cb_btn("🗂 Список категорий", "admin:cats"),
          cb_btn("➕ Добавить категорию", "admin:cat_add")],
         [cb_btn("🗑 Удалить категорию", "admin:cat_del")],
+        [cb_btn("👤 Настроить ID кассира", "admin:manager_id")],
         [cb_btn("📦 Остатки / стоп-лист", "admin:stock")],
         [cb_btn("📈 Топ продаж", "admin:stats")],
         [cb_btn("🖼 Загрузить QR-код", "admin:qr"),
@@ -920,6 +956,11 @@ async def handle_message(message):
         await send_menu(chat_id)
         return
 
+    if text.startswith("/myid"):
+        await api.send(chat_id, f"Ваш ID в MAX: `{user_id}`\n"
+                                "Передайте этот номер администратору для настройки уведомлений.")
+        return
+
     if text.startswith("/offer"):
         await api.send(
             chat_id,
@@ -1045,6 +1086,47 @@ async def handle_message(message):
         await menu_update(key, field, value)
         st_clear(user_id)
         await api.send(chat_id, "✅ Обновлено.", attachments=[admin_panel_keyboard()])
+        return
+
+    # ===== Состояния админа: кассир и переименование категории =====
+    if sname == "admin_manager_id" and text:
+        raw_id = text.strip()
+        if not raw_id.isdigit():
+            await api.send(chat_id, "Нужен числовой ID из команды /myid. Попробуйте ещё раз:")
+            return
+        manager_id = int(raw_id)
+        if manager_id <= 0:
+            await api.send(chat_id, "Некорректный ID. Введите положительное число:")
+            return
+        await set_setting("manager_chat_id", str(manager_id))
+        global MANAGER_CHAT_ID
+        MANAGER_CHAT_ID = manager_id
+        st_clear(user_id)
+        await api.send(chat_id,
+                       f"✅ ID кассира сохранён: {manager_id}.\n"
+                       "Убедитесь, что кассир уже отправил боту /start — иначе MAX "
+                       "не разрешит боту написать ему первым.",
+                       attachments=[admin_panel_keyboard()])
+        return
+
+    if sname == "admin_cat_rename" and text:
+        if len(text.strip()) < 2:
+            await api.send(chat_id, "Название слишком короткое. Введите минимум 2 символа:")
+            return
+        data = st_data(user_id)
+        key = data.get("key")
+        cats = await categories_all()
+        if not any(c["key"] == key for c in cats):
+            st_clear(user_id)
+            await api.send(chat_id, "Категория больше не существует.",
+                           attachments=[admin_panel_keyboard()])
+            return
+        new_name = text.strip()
+        await category_add(key, new_name, new_name)
+        st_clear(user_id)
+        await api.send(chat_id, f"✅ Название категории изменено на «{new_name}».",
+                       attachments=[kb([[cb_btn("🗂 К списку категорий", "admin:cats")],
+                                        [cb_btn("⬅️ В админ-панель", "admin:back")]])])
         return
 
     # ===== Состояния админа: категории =====
@@ -1325,9 +1407,12 @@ async def finalize_order(chat_id, user_id, username):
         manager_text += f"{discount_note}\n"
     manager_text += f"{delivery_note}\nИтого: {final_total} ₽"
 
-    sent = await api.send_to_user(MANAGER_CHAT_ID, manager_text,
-                                  attachments=[manager_keyboard(order_id, "new")])
-    manager_sent = sent is not None
+    manager_sent = await api.notify_staff(
+        manager_text, attachments=[manager_keyboard(order_id, "new")])
+    if not manager_sent:
+        log.error("Новый заказ #%s сохранён, но уведомление не доставлено ни одному "
+                  "сотруднику. Проверьте ID кассира/админа и запуск бота в их чате.",
+                  order_id)
 
     user_text = (
         f"✅ Ваш заказ **#{order_id}** успешно оформлен!\n\n"
@@ -1371,10 +1456,8 @@ async def finalize_order(chat_id, user_id, username):
                        attachments=[kb([[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
 
     if not manager_sent:
-        await api.send_to_user(
-            MANAGER_CHAT_ID,
-            "⚠️ Внимание: автоматическая отправка не удалась. Чек от клиента:\n\n"
-            + manager_text)
+        log.critical("Не удалось доставить уведомление о заказе #%s. Текст заказа:\n%s",
+                     order_id, manager_text)
 
     await cart_clear(user_id)
     await clear_garnishes(user_id)
@@ -1767,8 +1850,8 @@ async def handle_callback(update):
             f"Сумма: {order['total']} ₽\n\n"
             "Проверьте поступление оплаты и переведите заказ в приготовление."
         )
-        await api.send_to_user(MANAGER_CHAT_ID, manager_order_text,
-                               attachments=[manager_keyboard(order_id, "paid")])
+        await api.notify_staff(
+            manager_order_text, attachments=[manager_keyboard(order_id, "paid")])
         return
 
     # ===== Админ-панель =====
@@ -1808,12 +1891,41 @@ async def handle_callback(update):
         cats = await categories_all()
         text = "Категории:\n" + "\n".join(
             f"• {c['key']} — {c['display_name'] or c['name']}" for c in cats)
-        await ack()
-        await api.send(chat_id, text, attachments=[kb([
+        buttons = [[cb_btn(f"✏️ Изменить: {c['display_name'] or c['name']}",
+                           f"catrename:{c['key']}")]
+                   for c in cats if c["key"] != "default"]
+        buttons.extend([
             [cb_btn("➕ Добавить категорию", "admin:cat_add")],
             [cb_btn("🗑 Удалить категорию", "admin:cat_del")],
             [cb_btn("⬅️ В админ-панель", "admin:back")],
-        ])])
+        ])
+        await ack()
+        await api.send(chat_id, text, attachments=[kb(buttons)])
+        return
+
+    if payload == "admin:manager_id" and is_admin(user_id):
+        await ack()
+        await api.send(chat_id,
+                       "Чтобы узнать ID кассира, попросите его открыть чат с ботом "
+                       "по вашей ссылке и отправить команду /myid.\n\n"
+                       "Затем отправьте сюда полученный числовой ID. После этого "
+                       "новые заказы и сообщения об оплате будут приходить кассиру "
+                       "и администраторам.")
+        st_set(user_id, "admin_manager_id")
+        return
+
+    if payload.startswith("catrename:") and is_admin(user_id):
+        key = payload.split(":", 1)[1]
+        cats = await categories_all()
+        if not any(c["key"] == key for c in cats):
+            await ack("Категория не найдена")
+            return
+        if key == "default":
+            await ack("Служебную категорию переименовать нельзя")
+            return
+        st_set(user_id, "admin_cat_rename", key=key)
+        await ack()
+        await api.send(chat_id, f"Введите новое название категории «{key}»:")
         return
 
     if payload == "admin:cat_add" and is_admin(user_id):
