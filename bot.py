@@ -435,6 +435,11 @@ async def menu_get(key: str):
         async with db.execute("SELECT * FROM menu WHERE key = ?", (key,)) as cur:
             return await cur.fetchone()
 
+
+async def category_requires_garnish(category_key: str) -> bool:
+    """Гарнир нужен только для категорий из GARNISH_CATEGORIES."""
+    return category_key in GARNISH_CATEGORIES
+
 async def menu_add(key, name, description, price, category_key="default", photo_token=None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -1838,7 +1843,7 @@ async def handle_callback(update):
         if item["stock"] is not None and item["stock"] <= 0:
             await ack("Нет в наличии")
             return
-        if item["category_key"] in GARNISH_CATEGORIES:
+        if await category_requires_garnish(item["category_key"]):
             await ack()
             await api.send(chat_id, f"{item['name']} — выберите гарнир:",
                            attachments=[garnish_keyboard(key)])
