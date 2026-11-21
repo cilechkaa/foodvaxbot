@@ -201,6 +201,16 @@ async def init_db():
                 data TEXT NOT NULL DEFAULT '{}',
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS dish_ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                order_id INTEGER NOT NULL,
+                item_key TEXT NOT NULL,
+                rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, order_id, item_key)
+            )""")
 
         # Миграции (добавляем недостающие колонки в старые базы)
         async with db.execute("PRAGMA table_info(categories)") as cur:
@@ -743,6 +753,53 @@ async def stats_summary():
             "AND DATE(created_at) = DATE('now')") as cur:
             today = await cur.fetchone()
         return all_time, today
+
+async def dish_rating_summary(item_key):
+    """Средняя оценка и число оценок блюда."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT AVG(rating), COUNT(*) FROM dish_ratings WHERE item_key=?",
+            (item_key,)) as cur:
+            row = await cur.fetchone()
+    return (float(row[0]) if row and row[0] is not None else None,
+            int(row[1]) if row else 0)
+
+
+async def order_rating_items(order_id):
+    """Уникальные блюда из заказа, для которых можно запросить оценку."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT oi.item_key, MAX(m.name) AS name "
+            "FROM order_items oi LEFT JOIN menu m ON m.key=oi.item_key "
+            "WHERE oi.order_id=? GROUP BY oi.item_key ORDER BY name",
+            (order_id,)) as cur:
+            return await cur.fetchall()
+
+
+async def save_dish_rating(user_id, order_id, item_key, rating):
+    """Сохраняет/обновляет оценку только за блюдо из доставленного заказа."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM orders WHERE id=? AND user_id=? AND status='done'",
+            (order_id, user_id)) as cur:
+            order = await cur.fetchone()
+        if not order:
+            return False
+        async with db.execute(
+            "SELECT 1 FROM order_items WHERE order_id=? AND item_key=? LIMIT 1",
+            (order_id, item_key)) as cur:
+            purchased = await cur.fetchone()
+        if not purchased:
+            return False
+        await db.execute(
+            "INSERT INTO dish_ratings(user_id,order_id,item_key,rating) VALUES(?,?,?,?) "
+            "ON CONFLICT(user_id,order_id,item_key) DO UPDATE SET "
+            "rating=excluded.rating, created_at=CURRENT_TIMESTAMP",
+            (user_id, order_id, item_key, rating))
+        await db.commit()
+        return True
+
 
 # ================= MAX API КЛИЕНТ =================
 class MaxApi:
@@ -2107,6 +2164,11 @@ async def handle_callback(update):
         sold_out = (item["stock"] is not None and item["stock"] <= 0)
         desc = item["description"] if item["description"] else "Без описания"
         text = f"**{item['name']}**\n\n{desc}\n\n💰 **Цена: {item['price']} ₽**"
+        avg_rating, rating_count = await dish_rating_summary(key)
+        if rating_count:
+            text += f"\n⭐ **Оценка: {avg_rating:.1f}/5** ({rating_count})"
+        else:
+            text += "\n⭐ Пока нет оценок"
         if sold_out:
             text += "\n\n🚫 Сейчас нет в наличии"
         attachments = [await item_card_keyboard(user_id, key, item["category_key"])]
@@ -2303,6 +2365,31 @@ async def handle_callback(update):
         await address_set_default(user_id, address_id)
         await ack("Основной адрес выбран")
         await send_addresses(chat_id, user_id)
+        return
+
+    # ===== Оценка блюд после доставки =====
+    if payload.startswith("rate:"):
+        try:
+            _, raw_order_id, item_key, raw_rating = payload.split(":", 3)
+            rated_order_id = int(raw_order_id)
+            rating = int(raw_rating)
+        except (ValueError, TypeError):
+            await ack("Некорректная оценка")
+            return
+        if rating < 1 or rating > 5:
+            await ack("Оценка должна быть от 1 до 5")
+            return
+        saved = await save_dish_rating(user_id, rated_order_id, item_key, rating)
+        if not saved:
+            await ack("Оценить можно только блюдо из вашего доставленного заказа")
+            return
+        avg_rating, rating_count = await dish_rating_summary(item_key)
+        await ack(f"Спасибо за оценку: {rating}/5 ⭐")
+        item = await menu_get(item_key)
+        dish_name = item["name"] if item else item_key
+        await api.send(chat_id,
+                       f"Спасибо! Вы оценили «{dish_name}» на {rating}/5 ⭐\n"
+                       f"Средняя оценка блюда: {avg_rating:.1f}/5 ({rating_count} оценок).")
         return
 
     # ===== История и повтор заказа =====
@@ -2794,6 +2881,7 @@ async def handle_callback(update):
                 async with db.execute("SELECT COUNT(*) FROM orders") as cur:
                     row = await cur.fetchone()
                     orders_count = row[0] if row else 0
+                await db.execute("DELETE FROM dish_ratings")
                 await db.execute("DELETE FROM order_items")
                 await db.execute("DELETE FROM orders")
                 # Сбрасываем последовательность номеров, чтобы новые заказы начинались с №1.
@@ -3016,6 +3104,21 @@ async def handle_callback(update):
                 await api.send_to_user(
                     order["user_id"], notify_texts[new_status],
                     attachments=done_attachments)
+                if new_status == "done":
+                    rated_items = await order_rating_items(order_id)
+                    if rated_items:
+                        rating_buttons = []
+                        for rated_item in rated_items:
+                            item_name = rated_item["name"] or rated_item["item_key"]
+                            rating_buttons.append([cb_btn(
+                                f"{item_name[:24]} — {stars}⭐",
+                                f"rate:{order_id}:{rated_item['item_key']}:{stars}")
+                                for stars in range(1, 6)])
+                        await api.send_to_user(
+                            order["user_id"],
+                            f"🍽 Заказ #{order_id} доставлен! Оцените, пожалуйста, каждое блюдо. "
+                            "Нажмите на количество звёзд от 1 до 5. Оценку можно изменить повторным нажатием.",
+                            attachments=[kb(rating_buttons)])
             except Exception:
                 log.exception("Не удалось отправить клиенту уведомление о статусе заказа #%s",
                               order_id)
