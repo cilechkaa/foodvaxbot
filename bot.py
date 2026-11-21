@@ -1744,21 +1744,41 @@ async def handle_callback(update):
 
     # ===== Оформление заказа =====
     if payload == "order":
+        # Сначала подтверждаем нажатие MAX, не дожидаясь медленных запросов к БД.
+        # Иначе клиент повторно нажимает кнопку, а MAX присылает callback ещё раз.
+        await ack()
+
+        # Не запускаем оформление повторно, если пользователь уже находится
+        # внутри этого же процесса оформления.
+        current_state = st_get(user_id).get("state")
+        checkout_states = {
+            "waiting_name", "waiting_phone", "waiting_address",
+            "confirm_data", "waiting_time", "waiting_comment",
+            "admin_manager_id", "edit_phone", "edit_address"
+        }
+        if current_state in checkout_states:
+            await api.send(chat_id,
+                           "Оформление уже начато. Продолжите отвечать на вопросы выше.")
+            return
+
         rows = await cart_get(user_id)
         if not rows:
-            await ack("Корзина пуста")
+            await api.send(chat_id, "Корзина пуста. Добавьте блюда перед оформлением.")
             return
+
         total = Decimal("0")
         for key, qty in rows:
             item_key, _ = parse_cart_key(key)
             item = await menu_get(item_key)
-            if item:
+            if item and item["active"] and (item["stock"] is None or item["stock"] > 0):
                 total += Decimal(item["price"]) * qty
         if total < MIN_ORDER_AMOUNT:
             missing = MIN_ORDER_AMOUNT - total
-            await ack(f"Минимальный заказ {MIN_ORDER_AMOUNT} ₽. "
-                      f"Добавьте ещё на {missing} ₽")
+            await api.send(chat_id,
+                           f"Минимальный заказ {MIN_ORDER_AMOUNT} ₽. "
+                           f"Добавьте ещё на {missing} ₽.")
             return
+
         if user["name"] and user["phone"] and user["address"]:
             text = ("Ваши данные для доставки:\n\n"
                     f"👤 Имя: {user['name']}\n"
@@ -1766,7 +1786,6 @@ async def handle_callback(update):
                     f"📍 Адрес: {user['address']}\n\n"
                     "Все верно?")
             st_set(user_id, "confirm_data")
-            await ack()
             await api.send(chat_id, text,
                            attachments=[kb([
                                [cb_btn("✅ Да, оформить", "confirm_yes")],
@@ -1774,7 +1793,6 @@ async def handle_callback(update):
                            ])])
         else:
             st_set(user_id, "waiting_name")
-            await ack()
             await api.send(chat_id, "Как вас зовут?")
         return
 
