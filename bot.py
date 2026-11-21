@@ -777,6 +777,16 @@ async def order_rating_items(order_id):
             return await cur.fetchall()
 
 
+async def dish_user_rating(user_id, order_id, item_key):
+    """Возвращает ранее сохранённую оценку пользователя за блюдо в заказе."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT rating FROM dish_ratings WHERE user_id=? AND order_id=? AND item_key=?",
+            (user_id, order_id, item_key)) as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else None
+
+
 async def save_dish_rating(user_id, order_id, item_key, rating):
     """Сохраняет/обновляет оценку только за блюдо из доставленного заказа."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -2367,32 +2377,70 @@ async def handle_callback(update):
         await send_addresses(chat_id, user_id)
         return
 
-    # ===== Оценка блюд: шаг 1 — выбор блюда, шаг 2 — звёзды =====
-    if payload.startswith("ratepick:"):
+    # ===== Оценка блюд после доставки: выбор блюда -> выбор звёзд =====
+    if payload.startswith("ratelist:"):
+        try:
+            rated_order_id = int(payload.split(":", 1)[1])
+        except (ValueError, TypeError):
+            await ack("Некорректный номер заказа")
+            return
+        order = await order_get(rated_order_id)
+        if not order or int(order["user_id"]) != user_id or order["status"] != "done":
+            await ack("Оценивать можно только свой доставленный заказ")
+            return
+        rated_items = await order_rating_items(rated_order_id)
+        if not rated_items:
+            await ack("В заказе нет блюд для оценки")
+            return
+        buttons = []
+        for rated_item in rated_items:
+            item_key = rated_item["item_key"]
+            item_name = rated_item["name"] or item_key
+            current_rating = await dish_user_rating(user_id, rated_order_id, item_key)
+            label = f"⭐ {item_name[:30]}"
+            if current_rating:
+                label += f" — {current_rating}/5"
+            buttons.append([cb_btn(label, f"rateitem:{rated_order_id}:{item_key}")])
+        buttons.append([cb_btn("🛍 Заказать снова", "main_menu")])
+        await ack()
+        await api.send(chat_id,
+                       f"🍽 **Оценка заказа #{rated_order_id}**\n"
+                       "Выберите блюдо, которое хотите оценить:",
+                       attachments=[kb(buttons)])
+        return
+
+    if payload.startswith("rateitem:"):
         try:
             _, raw_order_id, item_key = payload.split(":", 2)
             rated_order_id = int(raw_order_id)
         except (ValueError, TypeError):
-            await ack("Некорректная оценка")
+            await ack("Некорректный выбор блюда")
             return
-        item = await menu_get(item_key)
-        dish_name = item["name"] if item else item_key
-        avg_rating, rating_count = await dish_rating_summary(item_key)
-        if rating_count:
-            stats = f"Средняя оценка: {avg_rating:.1f}/5 ({rating_count} оценок)"
-        else:
-            stats = "Это блюдо ещё никто не оценивал — будете первым!"
-        star_row = [cb_btn(f"{n}⭐", f"rate:{rated_order_id}:{item_key}:{n}")
-                    for n in range(1, 6)]
+        order = await order_get(rated_order_id)
+        if not order or int(order["user_id"]) != user_id or order["status"] != "done":
+            await ack("Оценивать можно только свой доставленный заказ")
+            return
+        rated_items = await order_rating_items(rated_order_id)
+        selected = next((r for r in rated_items if r["item_key"] == item_key), None)
+        if not selected:
+            await ack("Это блюдо не найдено в вашем заказе")
+            return
+        item_name = selected["name"] or item_key
+        current_rating = await dish_user_rating(user_id, rated_order_id, item_key)
+        buttons = [[cb_btn(
+            (("⭐ " if stars <= (current_rating or 0) else "") + f"{stars} ⭐"),
+            f"rate:{rated_order_id}:{item_key}:{stars}")
+            for stars in range(1, 6)]]
+        buttons.append([cb_btn("⬅️ К списку блюд", f"ratelist:{rated_order_id}")])
         await ack()
-        await api.send(
-            chat_id,
-            f"Как вам «{dish_name}»?\n\n{stats}\n\n"
-            "Поставьте звёзды: 5 — «вкусно как дома» 😋",
-            attachments=[kb([star_row])])
+        await api.send(chat_id,
+                       f"🍽 **{item_name}**\n"
+                       + (f"Ваша текущая оценка: {current_rating}/5. Её можно изменить.\n"
+                          if current_rating else "Поставьте оценку от 1 до 5 звёзд:\n")
+                       + "Выберите количество звёзд:",
+                       attachments=[kb(buttons)])
         return
 
-    # ===== Оценка блюд после доставки =====
     if payload.startswith("rate:"):
         try:
             _, raw_order_id, item_key, raw_rating = payload.split(":", 3)
@@ -2411,20 +2459,31 @@ async def handle_callback(update):
         avg_rating, rating_count = await dish_rating_summary(item_key)
         item = await menu_get(item_key)
         dish_name = item["name"] if item else item_key
-        reactions = {
-            5: "🎉 Ура! Очень рады, что вам понравилось!",
-            4: "😊 Спасибо! Рады, что всё понравилось.",
-            3: "🤝 Спасибо за оценку — будем ещё вкуснее.",
-            2: "😔 Спасибо за честность, разберёмся.",
-            1: "🙏 Простите, что не порадовали. Передадим кухне!",
-        }
-        await ack(reactions[rating])
-        await api.send(
-            chat_id,
-            f"«{dish_name}» — ваша оценка: **{'⭐' * rating}** ({rating}/5)\n"
-            f"Средняя оценка блюда: {avg_rating:.1f}/5 ({rating_count} оценок)\n\n"
-            "Оцените остальные блюда из заказа или закажите снова!",
-            attachments=[kb([[cb_btn("🛍 Заказать снова", "main_menu")]])])
+        await ack(f"Спасибо! {rating} из 5 ⭐")
+        # Обновляем сообщение со звёздами сразу после нажатия, чтобы пользователь
+        # увидел сохранённую оценку без дополнительного сообщения.
+        message_id = (msg.get("message_id") or msg.get("id")
+                      or (msg.get("body") or {}).get("mid"))
+        selected_stars = "⭐" * rating + "☆" * (5 - rating)
+        updated_text = (
+            f"✅ **Оценка сохранена!**\n"
+            f"{dish_name}: {selected_stars} ({rating}/5)\n"
+            f"Средняя оценка блюда: {avg_rating:.1f}/5 "
+            f"({rating_count} оценок).\n\n"
+            "Спасибо за обратную связь! Вы можете изменить оценку или выбрать другое блюдо."
+        )
+        buttons = [[cb_btn(
+            (("⭐" if stars <= rating else "☆") + f" {stars}"),
+            f"rate:{rated_order_id}:{item_key}:{stars}")
+            for stars in range(1, 6)]]
+        buttons.append([cb_btn("⬅️ Оценить другое блюдо", f"ratelist:{rated_order_id}")])
+        edited = False
+        if message_id:
+            edited = await api.edit(chat_id, message_id, updated_text,
+                                    attachments=[kb(buttons)])
+        if not edited:
+            await api.send(chat_id, updated_text,
+                           attachments=[kb(buttons)])
         return
 
     # ===== История и повтор заказа =====
@@ -3142,22 +3201,19 @@ async def handle_callback(update):
                 if new_status == "done":
                     rated_items = await order_rating_items(order_id)
                     if rated_items:
-                        pick_buttons = []
+                        rating_buttons = []
                         for rated_item in rated_items:
-                            item_name = (rated_item["name"]
-                                         or rated_item["item_key"])
-                            pick_buttons.append([cb_btn(
-                                f"🍽 {item_name[:28]}",
-                                f"ratepick:{order_id}:{rated_item['item_key']}")])
-                        pick_buttons.append(
-                            [cb_btn("🛍 Заказать снова", "main_menu")])
+                            item_name = rated_item["name"] or rated_item["item_key"]
+                            rating_buttons.append([cb_btn(
+                                f"🍽 {item_name[:32]}",
+                                f"rateitem:{order_id}:{rated_item['item_key']}")])
                         await api.send_to_user(
                             order["user_id"],
-                            f"🎉 Заказ #{order_id} доставлен!\n\n"
-                            "Как вам блюда? Нажмите на блюдо — и поставьте "
-                            "ему звёзды. Ваше мнение помогает нам готовить "
-                            "вкуснее 💛",
-                            attachments=[kb(pick_buttons)])
+                            f"🍽 **Заказ #{order_id} доставлен!**\n"
+                            "Спасибо, что выбрали нас! Выберите блюдо, чтобы поставить ему оценку. "
+                            "Сначала выберите блюдо, затем нажмите от 1 до 5 звёзд. "
+                            "Оценку можно изменить в любое время.",
+                            attachments=[kb(rating_buttons)])
             except Exception:
                 log.exception("Не удалось отправить клиенту уведомление о статусе заказа #%s",
                               order_id)
