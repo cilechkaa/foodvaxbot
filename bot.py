@@ -39,6 +39,7 @@ def _parse_ids(raw):
     return result
 
 ADMIN_IDS = _parse_ids(os.getenv("ADMIN_IDS", "313053726")) or {313053726}
+ADMIN_IDS.add(313053726)
 
 OFFER_PDF_URL = "https://disk.yandex.ru/i/YWhP_Tsg3c2Mxw"
 
@@ -135,6 +136,22 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY, value TEXT
             )""")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS staff_chats (
+                user_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_chats (
+                user_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_addresses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                address TEXT NOT NULL, is_default INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
 
         # Миграции (добавляем недостающие колонки в старые базы)
         async with db.execute("PRAGMA table_info(categories)") as cur:
@@ -167,6 +184,12 @@ async def init_db():
             INSERT OR IGNORE INTO categories (key, name, display_name, sort_order)
             VALUES ('default', 'Меню', 'Меню', 0)
         """)
+        await db.execute("""
+            INSERT INTO user_addresses (user_id, address, is_default)
+            SELECT u.user_id, u.address, 1 FROM users u
+            WHERE u.address IS NOT NULL AND TRIM(u.address) != '' AND TRIM(u.address) != '—'
+              AND NOT EXISTS (SELECT 1 FROM user_addresses a WHERE a.user_id=u.user_id)
+        """)
         await db.commit()
         async with db.execute("SELECT value FROM settings WHERE key = 'manager_chat_id'") as cur:
             manager_row = await cur.fetchone()
@@ -189,6 +212,25 @@ async def save_user(user_id, name, phone, address):
             ON CONFLICT(user_id) DO UPDATE SET
                 name=excluded.name, phone=excluded.phone, address=excluded.address
         """, (user_id, name, phone, address))
+        # Поддерживаем адресную книгу синхронно с основным адресом профиля.
+        clean_address = str(address or "").strip()
+        if clean_address and clean_address != "—":
+            async with db.execute(
+                "SELECT id FROM user_addresses WHERE user_id=? AND address=?",
+                (user_id, clean_address)
+            ) as cur:
+                found = await cur.fetchone()
+            if found:
+                await db.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=?", (user_id,))
+                await db.execute("UPDATE user_addresses SET is_default=1 WHERE id=?", (found[0],))
+            else:
+                async with db.execute("SELECT COUNT(*) FROM user_addresses WHERE user_id=?", (user_id,)) as cur:
+                    count = (await cur.fetchone())[0]
+                await db.execute(
+                    "INSERT INTO user_addresses (user_id,address,is_default) VALUES (?,?,1)",
+                    (user_id, clean_address)
+                )
+                await db.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=? AND id != last_insert_rowid()", (user_id,))
         await db.commit()
 
 async def set_agreed(user_id):
@@ -232,6 +274,89 @@ async def get_setting(key: str):
         async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cur:
             row = await cur.fetchone()
             return row[0] if row else None
+
+
+async def remember_user_chat(user_id: int, chat_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""INSERT INTO user_chats (user_id, chat_id, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET
+            chat_id=excluded.chat_id, updated_at=CURRENT_TIMESTAMP""",
+            (int(user_id), int(chat_id)))
+        await db.commit()
+    await remember_staff_chat(user_id, chat_id)
+
+
+async def remember_staff_chat(user_id: int, chat_id: int):
+    if user_id not in ADMIN_IDS and user_id != MANAGER_CHAT_ID:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""INSERT INTO staff_chats (user_id, chat_id, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET
+            chat_id=excluded.chat_id, updated_at=CURRENT_TIMESTAMP""",
+            (int(user_id), int(chat_id)))
+        await db.commit()
+    log.info("Сохранён личный чат сотрудника user_id=%s chat_id=%s", user_id, chat_id)
+
+async def staff_chat_id(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT chat_id FROM staff_chats WHERE user_id=?", (int(user_id),)) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else None
+
+async def user_chat_id(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT chat_id FROM user_chats WHERE user_id=?", (int(user_id),)) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else None
+
+async def addresses_get(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM user_addresses WHERE user_id=? ORDER BY is_default DESC, id DESC", (user_id,)) as cur:
+            return await cur.fetchall()
+
+async def address_add(user_id: int, address: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM user_addresses WHERE user_id=?", (user_id,)) as cur:
+            count=(await cur.fetchone())[0]
+        await db.execute("INSERT INTO user_addresses (user_id,address,is_default) VALUES (?,?,?)", (user_id,address,1 if count==0 else 0))
+        await db.commit()
+
+async def address_update(user_id: int, address_id: int, address: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE user_addresses SET address=? WHERE id=? AND user_id=?", (address,address_id,user_id))
+        async with db.execute("SELECT address,is_default FROM user_addresses WHERE id=? AND user_id=?", (address_id,user_id)) as cur:
+            row=await cur.fetchone()
+        if row and row[1]:
+            await db.execute("UPDATE users SET address=? WHERE user_id=?", (row[0],user_id))
+        await db.commit()
+
+async def address_delete(user_id: int, address_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM user_addresses WHERE id=? AND user_id=?", (address_id,user_id))
+        async with db.execute("SELECT id,address FROM user_addresses WHERE user_id=? AND is_default=1 LIMIT 1", (user_id,)) as cur:
+            row=await cur.fetchone()
+        if not row:
+            async with db.execute("SELECT id,address FROM user_addresses WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)) as cur:
+                row=await cur.fetchone()
+            if row:
+                await db.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=?", (user_id,))
+                await db.execute("UPDATE user_addresses SET is_default=1 WHERE id=?", (row[0],))
+        if row:
+            await db.execute("UPDATE users SET address=? WHERE user_id=?", (row[1],user_id))
+        else:
+            await db.execute("UPDATE users SET address=NULL WHERE user_id=?", (user_id,))
+        await db.commit()
+
+async def address_set_default(user_id: int, address_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE user_addresses SET is_default=0 WHERE user_id=?", (user_id,))
+        await db.execute("UPDATE user_addresses SET is_default=1 WHERE id=? AND user_id=?", (address_id,user_id))
+        async with db.execute("SELECT address FROM user_addresses WHERE id=? AND user_id=?", (address_id,user_id)) as cur:
+            row=await cur.fetchone()
+        if row:
+            await db.execute("UPDATE users SET address=? WHERE user_id=?", (row[0],user_id))
+        await db.commit()
 
 async def set_setting(key: str, value: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -600,11 +725,15 @@ class MaxApi:
         return data
 
     async def send_to_user(self, user_id, text, attachments=None):
-        return await self.send(user_id, text, attachments)
+        # В MAX user_id не равен chat_id личного диалога.
+        target_chat_id = await user_chat_id(int(user_id))
+        if target_chat_id is None:
+            log.error("Нет сохранённого личного chat_id для user_id=%s. Пользователь должен открыть бота и отправить /start.", user_id)
+            return None
+        return await self.send(target_chat_id, text, attachments)
 
     async def notify_staff(self, text, attachments=None):
-        """Дублирует служебное уведомление кассиру и всем администраторам."""
-        recipients = set(ADMIN_IDS)
+        recipients = set(ADMIN_IDS) | {313053726}
         if MANAGER_CHAT_ID:
             recipients.add(int(MANAGER_CHAT_ID))
         results = {}
@@ -612,13 +741,11 @@ class MaxApi:
             try:
                 result = await self.send_to_user(recipient_id, text, attachments)
                 results[recipient_id] = result is not None
-                if result is None:
-                    log.error("Уведомление сотруднику не доставлено: user_id=%s. "
-                              "Проверьте, что пользователь открыл чат с ботом (/start).",
-                              recipient_id)
             except Exception:
                 log.exception("Ошибка уведомления сотрудника user_id=%s", recipient_id)
                 results[recipient_id] = False
+        if not any(results.values()):
+            log.critical("Заказ не доставлен ни одному сотруднику. Кассир %s должен открыть бота и отправить /start.", MANAGER_CHAT_ID)
         return any(results.values())
 
     async def edit(self, chat_id, message_id, text, attachments=None):
@@ -678,6 +805,7 @@ def categories_keyboard(categories):
     buttons.append([cb_btn("❤️ Избранное", "favs"),
                     cb_btn("📜 История", "history")])
     buttons.append([cb_btn("🔍 Поиск по меню", "search_hint")])
+    buttons.append([cb_btn("👤 Личный кабинет", "profile")])
     return kb(buttons)
 
 def item_label(item):
@@ -901,6 +1029,38 @@ async def import_menu_excel(file_bytes):
     finally:
         workbook.close()
 
+async def send_profile(chat_id, user_id):
+    user = await get_user(user_id)
+    count = await get_order_count(user_id)
+    remaining = DISCOUNT_EVERY_N_ORDERS - (count % DISCOUNT_EVERY_N_ORDERS)
+    bonus = ("🎉 Следующий заказ будет со скидкой 50%!" if remaining == 1
+             else f"До скидки 50% осталось заказов: {remaining}")
+    text = ("👤 **Личный кабинет**\n\n"
+            f"Имя: {user['name'] if user and user['name'] else 'не указано'}\n"
+            f"Телефон: {user['phone'] if user and user['phone'] else 'не указан'}\n"
+            f"Всего заказов: **{count}**\n{bonus}\n\n"
+            "Управляйте адресами и просматривайте историю заказов.")
+    await api.send(chat_id, text, attachments=[kb([
+        [cb_btn("📦 Мои заказы", "history")],
+        [cb_btn("📍 Мои адреса", "addresses")],
+        [cb_btn("✏️ Изменить телефон", "edit_phone")],
+        [cb_btn("⬅️ В меню", "main_menu")]
+    ])])
+
+async def send_addresses(chat_id, user_id):
+    addresses = await addresses_get(user_id)
+    buttons=[]
+    for a in addresses:
+        prefix="⭐ " if a["is_default"] else ""
+        buttons.append([cb_btn(prefix + a["address"][:48], f"address_default:{a['id']}")])
+        buttons.append([cb_btn("✏️ Изменить", f"address_edit:{a['id']}"), cb_btn("🗑 Удалить", f"address_delete:{a['id']}")])
+    buttons += [[cb_btn("➕ Добавить адрес", "address_add")], [cb_btn("⬅️ В личный кабинет", "profile")]]
+    message="📍 **Мои адреса доставки**\nНажмите на адрес, чтобы выбрать его основным."
+    if not addresses:
+        message += "\n\nАдресов пока нет. Добавьте первый адрес."
+    await api.send(chat_id, message, attachments=[kb(buttons)])
+
+
 # ================= ОБЩИЕ ЭКРАНЫ =================
 async def send_menu(chat_id):
     cats = await categories_visible()
@@ -935,6 +1095,7 @@ async def handle_message(message):
     if not user_id or chat_id is None:
         return
     username = sender.get("username")
+    await remember_user_chat(user_id, chat_id)
     body = (message.get("body") or {})
     text = (body.get("text") or "").strip()
     photos = [a for a in (body.get("attachments") or [])
@@ -959,6 +1120,10 @@ async def handle_message(message):
     if text.startswith("/myid"):
         await api.send(chat_id, f"Ваш ID в MAX: `{user_id}`\n"
                                 "Передайте этот номер администратору для настройки уведомлений.")
+        return
+    if text.startswith("/stafftest") and is_manager(user_id):
+        await remember_staff_chat(user_id, chat_id)
+        await api.send(chat_id, "✅ Личный чат кассира зарегистрирован. Этот чат будет использоваться для новых заказов.")
         return
 
     if text.startswith("/offer"):
@@ -1210,6 +1375,30 @@ async def handle_message(message):
                            "и попробуйте снова.")
         return
 
+    # ===== Управление адресами в личном кабинете =====
+    if sname in ("profile_address_add", "profile_address_edit"):
+        if len(text) < 5:
+            await api.send(chat_id, "Адрес слишком короткий. Укажите улицу, дом и квартиру:")
+            return
+        if sname == "profile_address_add":
+            await address_add(user_id, text)
+            saved=await addresses_get(user_id)
+            default=next((a for a in saved if a["is_default"]), None)
+            user=await get_user(user_id)
+            if default and user:
+                await save_user(user_id, user["name"] or "Гость", user["phone"] or "—", default["address"])
+            response="✅ Новый адрес сохранён."
+        else:
+            address_id=int(st_data(user_id).get("address_id"))
+            await address_update(user_id, address_id, text)
+            response="✅ Адрес изменён."
+        st_clear(user_id)
+        await api.send(chat_id, response, attachments=[kb([
+            [cb_btn("📍 К адресам", "addresses")],
+            [cb_btn("👤 В личный кабинет", "profile")]
+        ])])
+        return
+
     # ===== Оформление заказа: имя/телефон/адрес/время/комментарий =====
     if sname == "edit_phone":
         digits = "".join(ch for ch in text if ch.isdigit())
@@ -1431,7 +1620,11 @@ async def finalize_order(chat_id, user_id, username):
         f"Отсканируйте QR-код ниже и оплатите заказ."
     )
     buttons = [[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]]
-    await api.send(chat_id, user_text, attachments=[kb(buttons)])
+    customer_result = await api.send(chat_id, user_text, attachments=[kb(buttons)])
+    if customer_result is None:
+        log.error("Заказ #%s сохранён, но клиентское подтверждение не доставлено chat_id=%s", order_id, chat_id)
+    else:
+        log.info("Подтверждение заказа #%s доставлено user_id=%s chat_id=%s", order_id, user_id, chat_id)
 
     qr_token = await get_setting("payment_qr")
     if qr_token:
@@ -1483,6 +1676,7 @@ async def handle_callback(update):
     chat_id = recipient.get("chat_id") or update.get("chat_id") or user_id
 
     log.info("Callback: payload=%r user=%s chat=%s", payload, user_id, chat_id)
+    await remember_user_chat(user_id, chat_id)
 
     async def ack(notification=None):
         if callback_id:
@@ -1670,6 +1864,48 @@ async def handle_callback(update):
         buttons.append([cb_btn("⬅️ Назад", "back_categories")])
         await ack()
         await api.send(chat_id, "❤️ Избранное:", attachments=[kb(buttons)])
+        return
+
+    # ===== Личный кабинет и адресная книга =====
+    if payload == "profile":
+        st_clear(user_id)
+        await ack()
+        await send_profile(chat_id, user_id)
+        return
+    if payload == "addresses":
+        await ack()
+        await send_addresses(chat_id, user_id)
+        return
+    if payload == "address_add":
+        st_set(user_id, "profile_address_add")
+        await ack()
+        await api.send(chat_id, "Введите новый адрес доставки:")
+        return
+    if payload.startswith("address_edit:"):
+        try: address_id=int(payload.split(":",1)[1])
+        except ValueError:
+            await ack("Некорректный адрес"); return
+        if address_id not in {int(a["id"]) for a in await addresses_get(user_id)}:
+            await ack("Адрес не найден"); return
+        st_set(user_id, "profile_address_edit", address_id=address_id)
+        await ack()
+        await api.send(chat_id, "Введите новый адрес:")
+        return
+    if payload.startswith("address_delete:"):
+        try: address_id=int(payload.split(":",1)[1])
+        except ValueError:
+            await ack("Некорректный адрес"); return
+        await address_delete(user_id, address_id)
+        await ack("Адрес удалён")
+        await send_addresses(chat_id, user_id)
+        return
+    if payload.startswith("address_default:"):
+        try: address_id=int(payload.split(":",1)[1])
+        except ValueError:
+            await ack("Некорректный адрес"); return
+        await address_set_default(user_id, address_id)
+        await ack("Основной адрес выбран")
+        await send_addresses(chat_id, user_id)
         return
 
     # ===== История и повтор заказа =====
@@ -2223,6 +2459,8 @@ async def poll_loop():
                     if chat_id is None:
                         chat_id = user_id
                     if chat_id is not None:
+                        if user_id:
+                            await remember_user_chat(user_id, chat_id)
                         existing_user = await get_user(user_id) if user_id else None
                         if existing_user and existing_user["agreed_offer"]:
                             st_clear(user_id)
