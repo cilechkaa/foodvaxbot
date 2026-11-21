@@ -786,11 +786,14 @@ class MaxApi:
         return any(results.values())
 
     async def edit(self, chat_id, message_id, text, attachments=None):
+        # MAX редактирует сообщение через PUT /messages?message_id=..., а не
+        # через PUT /messages/{message_id}. chat_id для этого метода не нужен.
         body = {"text": text or " ", "format": "markdown"}
         if attachments is not None:
             body["attachments"] = attachments
-        data = await self._request("PUT", f"/messages/{message_id}",
-                                   params={"chat_id": chat_id}, json_body=body)
+        data = await self._request("PUT", "/messages",
+                                   params={"message_id": message_id},
+                                   json_body=body)
         return data is not None
 
     async def get_upload_url(self, token_type: str):
