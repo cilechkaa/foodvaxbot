@@ -835,23 +835,20 @@ async def item_card_keyboard(user_id, item_key, cat_key):
         [cb_btn("🛒 Корзина", "cart")],
     ])
 
-def garnish_keyboard(item_key, selected_garnish=None):
-    fries_label = "Добавлено" if selected_garnish == "fries" else "🍟 Картофель фри"
-    rice_label = "Добавлено" if selected_garnish == "rice" else "🍚 Отварной рис"
+def garnish_keyboard(item_key):
     return kb([
-        [cb_btn(fries_label, f"garnish:{item_key}:fries")],
-        [cb_btn(rice_label, f"garnish:{item_key}:rice")],
-        [cb_btn("⬅️ Назад", f"cat_back:{item_key}")],
+        [cb_btn("🍟 Картофель фри", f"garnish:{item_key}:fries")],
+        [cb_btn("🍚 Отварной рис", f"garnish:{item_key}:rice")],
         [cb_btn("🏠 Главное меню", "main_menu")],
         [cb_btn("🛒 Корзина", "cart")],
     ])
 
 def manager_keyboard(order_id, status):
     transitions = {
-        "new": [("👨‍🍳 Готовится", "cooking"), ("❌ Отменить", "cancelled")],
-        "paid": [("👨‍🍳 Готовится", "cooking"), ("❌ Отменить", "cancelled")],
-        "cooking": [("🛵 В доставке", "delivering"), ("❌ Отменить", "cancelled")],
-        "delivering": [("✅ Доставлен", "done"), ("❌ Отменить", "cancelled")],
+        "new": [("👨‍🍳 Готовится", "cooking")],
+        "paid": [("👨‍🍳 Готовится", "cooking")],
+        "cooking": [("🛵 В доставке", "delivering")],
+        "delivering": [("✅ Доставлен", "done")],
         "done": [], "cancelled": [],
     }
     buttons = [[cb_btn(label, f"setstatus:{order_id}:{next_status}")]
@@ -874,6 +871,7 @@ def admin_panel_keyboard():
         [cb_btn("🗂 Список категорий", "admin:cats"),
          cb_btn("➕ Добавить категорию", "admin:cat_add")],
         [cb_btn("🗑 Удалить категорию", "admin:cat_del")],
+        [cb_btn("🧹 Удалить всё меню", "admin:menu_delete_confirm")],
         [cb_btn("👤 Настроить ID кассира", "admin:manager_id")],
         [cb_btn("📦 Остатки / стоп-лист", "admin:stock")],
         [cb_btn("📈 Топ продаж", "admin:stats")],
@@ -1632,7 +1630,8 @@ async def finalize_order(chat_id, user_id, username):
         f"📌 **Для оплаты:**\n"
         f"Отсканируйте QR-код ниже и оплатите заказ."
     )
-    buttons = [[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]]
+    buttons = [[link_btn("💬 Написать кассиру", MANAGER_USERNAME)],
+               [cb_btn("❌ Отменить заказ", f"cancel_order:{order_id}")]]
     customer_result = await api.send(chat_id, user_text, attachments=[kb(buttons)])
     if customer_result is None:
         log.error("Заказ #%s сохранён, но клиентское подтверждение не доставлено chat_id=%s", order_id, chat_id)
@@ -1647,7 +1646,8 @@ async def finalize_order(chat_id, user_id, username):
             f"Сумма: **{final_total} ₽**\n\n"
             "Отсканируйте QR-код и оплатите заказ. После оплаты нажмите «Я оплатил».",
             attachments=[photo_attachment(qr_token),
-                         kb([[cb_btn("✅ Я оплатил", f"paid:{order_id}")]])])
+                         kb([[cb_btn("✅ Я оплатил", f"paid:{order_id}")],
+                             [cb_btn("❌ Отменить заказ", f"cancel_order:{order_id}")]])])
         if qr_sent is None:
             log.error("Не удалось отправить QR-код клиенту для заказа #%s", order_id)
             await api.send(chat_id,
@@ -1815,24 +1815,34 @@ async def handle_callback(update):
         if garnish not in GARNISH_LABELS:
             await ack("Неизвестный гарнир")
             return
+        # Для одной позиции блюда разрешён только один выбор гарнира.
+        saved_garnishes = await get_all_garnishes(user_id)
+        already_selected = any(parse_cart_key(k)[0] == item_key
+                               for k in saved_garnishes)
+        if already_selected:
+            await ack("Гарнир для этого блюда уже выбран")
+            return
+        item = await menu_get(item_key)
+        if not item:
+            await ack("Блюдо не найдено")
+            return
         await set_garnish(user_id, item_key, garnish)
         await cart_add(user_id, item_key, garnish)
-        await ack("Добавлено")
+        await ack("✅ Гарнир выбран")
+        # Возвращаем пользователя к списку блюд категории; «Добавлено» — только текст,
+        # обе кнопки выбора гарнира исчезают вместе с клавиатурой.
+        items = await menu_all(category_key=item["category_key"], in_stock_only=True)
         message_id = (msg.get("message_id") or msg.get("id")
                       or (msg.get("body") or {}).get("mid"))
-        prompt_text = ((msg.get("body") or {}).get("text")
-                       or f"{(await menu_get(item_key) or {}).get('name', 'Блюдо')} — выберите гарнир:")
-        updated = False
+        info_text = f"✅ Гарнир «{GARNISH_LABELS[garnish]}» добавлен к блюду «{item['name']}»."
         if message_id:
-            updated = await api.edit(
-                chat_id, message_id, prompt_text,
-                attachments=[garnish_keyboard(item_key, selected_garnish=garnish)])
-        if not updated:
-            item = await menu_get(item_key)
-            await api.send(
-                chat_id,
-                f"✅ Гарнир «{GARNISH_LABELS[garnish]}» добавлен к блюду «{item['name'] if item else 'Блюдо'}».",
-                attachments=[garnish_keyboard(item_key, selected_garnish=garnish)])
+            edited = await api.edit(chat_id, message_id, info_text,
+                                    attachments=[menu_keyboard(items, item["category_key"])])
+        else:
+            edited = False
+        if not edited:
+            await api.send(chat_id, info_text,
+                           attachments=[menu_keyboard(items, item["category_key"])])
         return
 
     if payload == "cart":
@@ -1959,9 +1969,11 @@ async def handle_callback(update):
                     f"{o['items']}\n\n💰 Итого: {o['total']} ₽")
             if o["delivery_time"] and o["delivery_time"] != "—":
                 text += f"\n⏰ К времени: {o['delivery_time']}"
-            await api.send(chat_id, text,
-                           attachments=[kb([[cb_btn("🔁 Повторить заказ",
-                                                    f"reorder:{o['id']}")]])])
+            history_buttons = [[cb_btn("🔁 Повторить заказ", f"reorder:{o['id']}")]]
+            if o["status"] in ("new", "paid"):
+                history_buttons.append([cb_btn("❌ Отменить заказ",
+                                                f"cancel_order:{o['id']}")])
+            await api.send(chat_id, text, attachments=[kb(history_buttons)])
         return
 
     if payload.startswith("reorder:"):
@@ -2111,6 +2123,32 @@ async def handle_callback(update):
                        attachments=[kb([[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
         return
 
+    if payload.startswith("cancel_order:"):
+        try:
+            order_id = int(payload.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await ack("Некорректный заказ")
+            return
+        order = await order_get(order_id)
+        if not order or int(order["user_id"]) != int(user_id):
+            await ack("Заказ не найден")
+            return
+        if order["status"] not in ("new", "paid"):
+            await ack("Заказ уже готовится или передан дальше — отмена недоступна")
+            return
+        await order_set_status(order_id, "cancelled")
+        await decrement_order_count(user_id)
+        await ack("Заказ отменён")
+        await api.send(chat_id, "❌ Ваш заказ отменён.",
+                       attachments=[kb([[cb_btn("🏠 Главное меню", "main_menu")]])])
+        try:
+            await api.notify_staff(
+                f"❌ Клиент отменил заказ #{order_id}.\n"
+                f"Клиент: {order['name']} (ID: {order['user_id']})")
+        except Exception:
+            log.exception("Не удалось уведомить сотрудников об отмене заказа #%s", order_id)
+        return
+
     if payload.startswith("paid:"):
         try:
             order_id = int(payload.split(":", 1)[1])
@@ -2154,6 +2192,28 @@ async def handle_callback(update):
         st_set(user_id, "admin_add_key")
         await ack()
         await api.send(chat_id, "Ключ блюда (латиницей):")
+        return
+
+    if payload == "admin:menu_delete_confirm" and is_admin(user_id):
+        await ack()
+        await api.send(
+            chat_id,
+            "⚠️ **Подтвердите удаление всего меню**\n\n"
+            "Будут удалены все блюда. Это действие нельзя отменить.",
+            attachments=[kb([
+                [cb_btn("🗑 Да, удалить всё меню", "admin:menu_delete_all")],
+                [cb_btn("Отмена", "admin:back")],
+            ])])
+        return
+
+    if payload == "admin:menu_delete_all" and is_admin(user_id):
+        items = await menu_all(active_only=False)
+        for menu_item in items:
+            await menu_delete(menu_item["key"])
+        await ack("Меню очищено")
+        await api.send(chat_id,
+                       f"🗑 Удалено блюд: {len(items)}. Категории и настройки сохранены.",
+                       attachments=[admin_panel_keyboard()])
         return
 
     if payload == "admin:list" and is_admin(user_id):
@@ -2432,6 +2492,13 @@ async def handle_callback(update):
             await ack("Заказ не найден")
             return
         previous_status = order["status"]
+        allowed_transitions = {
+            "new": {"cooking"}, "paid": {"cooking"},
+            "cooking": {"delivering"}, "delivering": {"done"},
+        }
+        if new_status not in allowed_transitions.get(previous_status, set()):
+            await ack("Это изменение статуса недоступно")
+            return
         await order_set_status(order_id, new_status)
         if new_status == "cancelled" and previous_status != "cancelled":
             await decrement_order_count(order["user_id"])
