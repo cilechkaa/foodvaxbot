@@ -1044,6 +1044,7 @@ def admin_panel_keyboard():
         [cb_btn("🗑 Удалить категорию", "admin:cat_del")],
         [cb_btn("👤 Настроить ID кассира", "admin:manager_id"),
          cb_btn("📋 Активные заказы", "admin:orders")],
+        [cb_btn("🧹 Сбросить все заказы", "admin:orders_clear_confirm")],
         [cb_btn("📦 Остатки / стоп-лист", "admin:stock")],
         [cb_btn("📈 Топ продаж", "admin:stats")],
         [cb_btn("🖼 Загрузить QR-код", "admin:qr"),
@@ -2763,6 +2764,51 @@ async def handle_callback(update):
                 await api.send(chat_id, f"— Часть {i}/{len(parts)} —\n```\n{part}\n```")
         except Exception as e:
             await api.send(chat_id, f"❌ Не удалось сделать копию: {e}")
+        return
+
+    if payload == "admin:orders_clear_confirm" and is_admin(user_id):
+        # Сначала показываем отдельное подтверждение, чтобы исключить случайное удаление.
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*) FROM orders") as cur:
+                row = await cur.fetchone()
+                orders_count = row[0] if row else 0
+        await ack()
+        await api.send(
+            chat_id,
+            f"⚠️ Вы действительно хотите удалить ВСЕ заказы?\n"
+            f"Будет удалено заказов: {orders_count}.\n"
+            "Также будут удалены связанные позиции заказов.\n"
+            "Меню, клиенты, адреса, настройки и счётчики скидок останутся.\n"
+            "Действие нельзя отменить.",
+            attachments=[kb([
+                [cb_btn("🧹 Да, удалить все заказы", "admin:orders_clear_yes")],
+                [cb_btn("↩️ Нет, вернуться", "admin:back")],
+            ])]
+        )
+        return
+
+    if payload == "admin:orders_clear_yes" and is_admin(user_id):
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute("SELECT COUNT(*) FROM orders") as cur:
+                    row = await cur.fetchone()
+                    orders_count = row[0] if row else 0
+                await db.execute("DELETE FROM order_items")
+                await db.execute("DELETE FROM orders")
+                # Сбрасываем последовательность номеров, чтобы новые заказы начинались с №1.
+                await db.execute("DELETE FROM sqlite_sequence WHERE name = 'orders'")
+                await db.commit()
+            await ack("Все заказы удалены")
+            await api.send(
+                chat_id,
+                f"✅ Готово. Удалено заказов: {orders_count}.\n"
+                "История заказов очищена. Счётчики скидок клиентов сохранены.",
+                attachments=[admin_panel_keyboard()]
+            )
+        except Exception as e:
+            await ack("Не удалось удалить заказы")
+            await api.send(chat_id, f"❌ Ошибка при сбросе заказов: {e}")
         return
 
     if payload == "admin:orders" and is_admin(user_id):
