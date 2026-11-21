@@ -1042,6 +1042,7 @@ def admin_panel_keyboard():
         [cb_btn("🗂 Список категорий", "admin:cats"),
          cb_btn("➕ Добавить категорию", "admin:cat_add")],
         [cb_btn("🗑 Удалить категорию", "admin:cat_del")],
+        [cb_btn("📋 Активные заказы", "admin:orders")],
         [cb_btn("👤 Настроить ID кассира", "admin:manager_id")],
         [cb_btn("📦 Остатки / стоп-лист", "admin:stock")],
         [cb_btn("📈 Топ продаж", "admin:stats")],
@@ -2762,6 +2763,86 @@ async def handle_callback(update):
                 await api.send(chat_id, f"— Часть {i}/{len(parts)} —\n```\n{part}\n```")
         except Exception as e:
             await api.send(chat_id, f"❌ Не удалось сделать копию: {e}")
+        return
+
+    if payload == "admin:orders" and is_admin(user_id):
+        active_statuses = ("new", "paid", "cooking", "delivering")
+        counts = {}
+        async with aiosqlite.connect(DB_PATH) as db:
+            for status in active_statuses:
+                async with db.execute(
+                    "SELECT COUNT(*) FROM orders WHERE status = ?", (status,)
+                ) as cur:
+                    row = await cur.fetchone()
+                    counts[status] = row[0] if row else 0
+        labels = {
+            "new": "🆕 Новые / ожидают оплаты",
+            "paid": "💳 Клиент сообщил об оплате",
+            "cooking": "👨‍🍳 Готовятся",
+            "delivering": "🛵 Доставляются",
+        }
+        lines = ["📋 **Активные заказы**", ""]
+        for status in active_statuses:
+            lines.append(f"{labels[status]}: **{counts[status]}**")
+        buttons = [[cb_btn(f"{labels[status]} ({counts[status]})",
+                           f"admin:orders:{status}")]
+                   for status in active_statuses]
+        buttons.append([cb_btn("🔄 Обновить", "admin:orders")])
+        buttons.append([cb_btn("⬅️ В админ-панель", "admin:back")])
+        await ack()
+        await api.send(chat_id, "\n".join(lines), attachments=[kb(buttons)])
+        return
+
+    if payload.startswith("admin:orders:") and is_admin(user_id):
+        status = payload.split(":", 2)[2]
+        if status not in {"new", "paid", "cooking", "delivering"}:
+            await ack("Неизвестный статус")
+            return
+        orders = await orders_by_status(status, limit=30)
+        if not orders:
+            await ack("Заказов в этом статусе нет")
+            await api.send(chat_id, "В этой категории пока нет заказов.",
+                           attachments=[kb([[cb_btn("⬅️ К активным заказам", "admin:orders")]])])
+            return
+        buttons = []
+        for order in orders:
+            buttons.append([cb_btn(
+                f"№{order['id']} · {order['name'] or 'Клиент'} · {order['total']} ₽",
+                f"admin:order:{order['id']}")])
+        buttons.append([cb_btn("🔄 Обновить", f"admin:orders:{status}")])
+        buttons.append([cb_btn("⬅️ К активным заказам", "admin:orders")])
+        await ack()
+        await api.send(chat_id,
+                       f"{STATUS_LABELS.get(status, status)}\nЗаказов: {len(orders)}",
+                       attachments=[kb(buttons)])
+        return
+
+    if payload.startswith("admin:order:") and is_admin(user_id):
+        try:
+            order_id = int(payload.rsplit(":", 1)[1])
+        except ValueError:
+            await ack("Некорректный номер заказа")
+            return
+        order = await order_get(order_id)
+        if not order:
+            await ack("Заказ не найден")
+            return
+        detail = (
+            f"📦 **Заказ №{order['id']}**\n"
+            f"Статус: {STATUS_LABELS.get(order['status'], order['status'])}\n"
+            f"Клиент: {order['name']} (@{order['username']}, ID: {order['user_id']})\n"
+            f"Телефон: {order['phone']}\nАдрес: {order['address']}\n"
+            f"Время: {order['delivery_time'] or '—'}\n"
+            f"Комментарий: {order['comment'] or '—'}\n\n"
+            f"{order['items']}\n\nИтого: **{order['total']} ₽**\n"
+            f"Создан: {order['created_at']}"
+        )
+        await ack()
+        await api.send(chat_id, detail, attachments=[kb([
+            [cb_btn("🔄 Обновить заказ", f"admin:order:{order_id}")],
+            [cb_btn("⬅️ К активным заказам", "admin:orders")],
+            [cb_btn("⬅️ В админ-панель", "admin:back")],
+        ])])
         return
 
     if payload == "admin:back" and is_admin(user_id):
