@@ -802,7 +802,8 @@ class MaxApi:
         return data is not None
 
     async def get_upload_url(self, token_type: str):
-        return await self._request("GET", "/uploads",
+        # По актуальному Bot API MAX URL для загрузки получается через POST /uploads.
+        return await self._request("POST", "/uploads",
                                    params={"type": token_type})
 
     async def download_bytes(self, url):
@@ -822,21 +823,65 @@ class MaxApi:
             log.exception("Ошибка скачивания файла %s", url)
             return None
 
-    async def upload_bytes(self, data: bytes, token_type: str = "image"):
+    async def upload_bytes(self, data: bytes, token_type: str = "image",
+                           filename: str = "photo.jpg"):
+        """Загружает файл в MAX через multipart/form-data и возвращает токен."""
         info = await self.get_upload_url(token_type)
         if not info or not info.get("url"):
+            log.error("MAX не выдал URL загрузки для типа %s: %r", token_type, info)
             return None
         try:
-            async with self.session.post(info["url"], data=data,
-                                         ssl=False) as resp:
+            form = aiohttp.FormData()
+            form.add_field("data", data, filename=filename,
+                           content_type="application/octet-stream")
+            async with self.session.post(info["url"], data=form, ssl=False) as resp:
+                response_text = await resp.text()
                 if resp.status >= 400:
+                    log.error("MAX upload вернул %s: %s", resp.status,
+                              response_text[:1000])
                     return None
-                res = await resp.json(content_type=None)
-                token = (res or {}).get("token")
+                try:
+                    result = await resp.json(content_type=None)
+                except Exception:
+                    result = {}
+                token = (result or {}).get("token")
+                if not token:
+                    # Для изображений MAX в некоторых ответах возвращает
+                    # объект photos с токеном внутри.
+                    photos = (result or {}).get("photos") or {}
+                    if isinstance(photos, dict):
+                        for photo in photos.values():
+                            if isinstance(photo, dict) and photo.get("token"):
+                                token = photo["token"]
+                                break
+                if not token:
+                    log.error("MAX загрузил файл, но токен не найден: %r", result)
                 return token
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning("Загрузка файла не удалась: %s", e)
             return None
+
+    async def image_token_from_attachment(self, attachment):
+        """Получает токен изображения из входящего вложения MAX.
+
+        Если MAX прислал готовый image-token, используем его. Если пришёл
+        документ/изображение со ссылкой, скачиваем файл и загружаем как image.
+        """
+        if not isinstance(attachment, dict):
+            return None
+        payload = attachment.get("payload") or {}
+        token = payload.get("token")
+        if token:
+            return token
+        url = payload.get("url") or attachment.get("url")
+        if not url:
+            return None
+        image_bytes = await self.download_bytes(url)
+        if not image_bytes:
+            return None
+        filename = (attachment.get("filename") or attachment.get("name") or
+                    payload.get("filename") or payload.get("name") or "photo.jpg")
+        return await self.upload_bytes(image_bytes, "image", filename=filename)
 
 api = MaxApi(BOT_TOKEN)
 
@@ -1167,14 +1212,21 @@ async def handle_message(message):
     await remember_user_chat(user_id, chat_id)
     body = (message.get("body") or {})
     text = (body.get("text") or "").strip()
-    photos = [a for a in (body.get("attachments") or [])
-              if a.get("type") == "image"]
-    photo_token = None
-    if photos:
-        photo_token = (photos[-1].get("payload") or {}).get("token")
-
     state = st_get(user_id)
     sname = state.get("state")
+    incoming_images = [a for a in (body.get("attachments") or [])
+                       if a.get("type") in ("image", "file")]
+    photo_token = None
+    # Не скачиваем и не загружаем вложения обычных сообщений клиентов.
+    # Общий обработчик используется только в состояниях ручной загрузки фото.
+    wants_photo = (sname == "admin_add_photo" or
+                   (sname == "admin_edit_value" and
+                    st_data(user_id).get("field") == "photo_token"))
+    if wants_photo and incoming_images:
+        for incoming_image in reversed(incoming_images):
+            photo_token = await api.image_token_from_attachment(incoming_image)
+            if photo_token:
+                break
 
     if text.startswith("/start"):
         user = await get_user(user_id)
@@ -1443,9 +1495,9 @@ async def handle_message(message):
                         attachment.get("name") or
                         payload_file.get("filename") or
                         payload_file.get("name") or "").strip()
-            file_url = payload_file.get("url")
+            file_url = payload_file.get("url") or attachment.get("url")
             if not filename or not filename.lower().endswith(allowed_extensions):
-                skipped.append(f"{filename or 'Файл без имени'} — нужен файл изображения")
+                skipped.append(f"{filename or 'Файл без имени'} — нужно изображение с расширением JPG, PNG или WEBP")
                 continue
             name_key = _photo_name_key(filename)
             if name_key in ambiguous_names:
@@ -1455,16 +1507,12 @@ async def handle_message(message):
             if not menu_item:
                 skipped.append(f"{filename} — блюдо с таким названием не найдено")
                 continue
-            if not file_url:
-                skipped.append(f"{filename} — MAX не передал ссылку на файл")
-                continue
-            image_bytes = await api.download_bytes(file_url)
-            if not image_bytes:
-                skipped.append(f"{filename} — не удалось скачать файл")
-                continue
-            token = await api.upload_bytes(image_bytes, "image")
+            # Для вложения типа image MAX может сразу прислать готовый token.
+            # Для file/document скачиваем URL и загружаем в MAX именно как image.
+            token = await api.image_token_from_attachment(attachment)
             if not token:
-                skipped.append(f"{filename} — MAX не принял изображение")
+                reason = "не удалось получить токен изображения (проверьте URL/формат файла)"
+                skipped.append(f"{filename} — {reason}")
                 continue
             await menu_update(menu_item["key"], "photo_token", token)
             uploaded += 1
