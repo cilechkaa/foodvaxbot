@@ -835,10 +835,12 @@ async def item_card_keyboard(user_id, item_key, cat_key):
         [cb_btn("🛒 Корзина", "cart")],
     ])
 
-def garnish_keyboard(item_key):
+def garnish_keyboard(item_key, selected_garnish=None):
+    fries_label = "Добавлено" if selected_garnish == "fries" else "🍟 Картофель фри"
+    rice_label = "Добавлено" if selected_garnish == "rice" else "🍚 Отварной рис"
     return kb([
-        [cb_btn("🍟 Картофель фри", f"garnish:{item_key}:fries")],
-        [cb_btn("🍚 Отварной рис", f"garnish:{item_key}:rice")],
+        [cb_btn(fries_label, f"garnish:{item_key}:fries")],
+        [cb_btn(rice_label, f"garnish:{item_key}:rice")],
         [cb_btn("⬅️ Назад", f"cat_back:{item_key}")],
         [cb_btn("🏠 Главное меню", "main_menu")],
         [cb_btn("🛒 Корзина", "cart")],
@@ -1615,7 +1617,7 @@ async def finalize_order(chat_id, user_id, username):
                   order_id)
 
     user_text = (
-        f"✅ Ваш заказ **#{order_id}** успешно оформлен!\n\n"
+        "✅ Ваш заказ успешно оформлен!\n\n"
         f"Имя: {data.get('name')}\n"
         f"Адрес: {data.get('address')}\n"
         f"⏰ Время доставки: {data.get('delivery_time', '—')}\n"
@@ -1641,7 +1643,7 @@ async def finalize_order(chat_id, user_id, username):
     if qr_token:
         qr_sent = await api.send(
             chat_id,
-            f"💳 **Оплата заказа #{order_id}**\n"
+            "💳 **Оплата заказа**\n"
             f"Сумма: **{final_total} ₽**\n\n"
             "Отсканируйте QR-код и оплатите заказ. После оплаты нажмите «Я оплатил».",
             attachments=[photo_attachment(qr_token),
@@ -1810,11 +1812,27 @@ async def handle_callback(update):
 
     if payload.startswith("garnish:"):
         _, item_key, garnish = payload.split(":")
+        if garnish not in GARNISH_LABELS:
+            await ack("Неизвестный гарнир")
+            return
         await set_garnish(user_id, item_key, garnish)
         await cart_add(user_id, item_key, garnish)
-        item = await menu_get(item_key)
-        await ack(f"✅ {item['name'] if item else 'Блюдо'} добавлено. "
-                  f"Гарнир: {GARNISH_LABELS[garnish]}")
+        await ack("Добавлено")
+        message_id = (msg.get("message_id") or msg.get("id")
+                      or (msg.get("body") or {}).get("mid"))
+        prompt_text = ((msg.get("body") or {}).get("text")
+                       or f"{(await menu_get(item_key) or {}).get('name', 'Блюдо')} — выберите гарнир:")
+        updated = False
+        if message_id:
+            updated = await api.edit(
+                chat_id, message_id, prompt_text,
+                attachments=[garnish_keyboard(item_key, selected_garnish=garnish)])
+        if not updated:
+            item = await menu_get(item_key)
+            await api.send(
+                chat_id,
+                f"✅ Гарнир «{GARNISH_LABELS[garnish]}» добавлен к блюду «{item['name'] if item else 'Блюдо'}».",
+                attachments=[garnish_keyboard(item_key, selected_garnish=garnish)])
         return
 
     if payload == "cart":
@@ -1936,8 +1954,7 @@ async def handle_callback(update):
             return
         await ack()
         for o in orders:
-            text = (f"📜 Заказ #{o['id']} — "
-                    f"{STATUS_LABELS.get(o['status'], o['status'])}\n"
+            text = (f"📜 {STATUS_LABELS.get(o['status'], o['status'])}\n"
                     f"Создан: {o['created_at']}\n"
                     f"{o['items']}\n\n💰 Итого: {o['total']} ₽")
             if o["delivery_time"] and o["delivery_time"] != "—":
@@ -1975,7 +1992,7 @@ async def handle_callback(update):
         text, kbd_ = await cart_text_and_keyboard(user_id)
         await ack()
         await api.send(chat_id,
-                       f"🔁 Заказ #{order_id} добавлен в корзину ({added} поз.):\n\n{text}",
+                       f"🔁 Предыдущий заказ добавлен в корзину ({added} поз.):\n\n{text}",
                        attachments=[kbd_])
         return
 
@@ -2113,7 +2130,7 @@ async def handle_callback(update):
         await order_set_status(order_id, "paid")
         await ack("Спасибо! Сообщение об оплате отправлено кассиру.")
         await api.send(chat_id,
-                       f"💳 Вы сообщили об оплате заказа **#{order_id}**.\n"
+                       "💳 Вы сообщили об оплате заказа.\n"
                        "Статус: **Оплата ожидает проверки кассиром**.\n"
                        "После проверки кассир обновит статус заказа, и бот сообщит вам.")
         manager_order_text = (
@@ -2430,19 +2447,25 @@ async def handle_callback(update):
         await api.send(chat_id, new_text,
                        attachments=[manager_keyboard(order_id, new_status)])
         notify_texts = {
-            "paid": "💳 Кассир отметил оплату заказа #{}.",
-            "cooking": "👨‍🍳 Ваш заказ #{} уже готовится!",
-            "delivering": "🛵 Ваш заказ #{} уже везёт курьер!",
-            "done": "✅ Заказ #{} доставлен. Приятного аппетита!",
-            "cancelled": "❌ Заказ #{} отменён. Свяжитесь с кассиром, "
+            "paid": "💳 Кассир отметил оплату вашего заказа.",
+            "cooking": "👨‍🍳 Ваш заказ уже готовится!",
+            "delivering": "🛵 Ваш заказ уже везёт курьер!",
+            "done": "✅ Заказ доставлен! Приятного аппетита!",
+            "cancelled": "❌ Заказ отменён. Свяжитесь с кассиром, "
                          "если это ошибка.",
         }
         if new_status in notify_texts and new_status != previous_status:
             try:
-                await api.send_to_user(order["user_id"],
-                                       notify_texts[new_status].format(order_id))
+                done_attachments = (
+                    [kb([[cb_btn("🛍 Заказать снова", "main_menu")]])]
+                    if new_status == "done" else None
+                )
+                await api.send_to_user(
+                    order["user_id"], notify_texts[new_status],
+                    attachments=done_attachments)
             except Exception:
-                pass
+                log.exception("Не удалось отправить клиенту уведомление о статусе заказа #%s",
+                              order_id)
         return
 
     await ack()
