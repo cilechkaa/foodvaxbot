@@ -697,7 +697,10 @@ class MaxApi:
                   "types": "message_created,message_callback,bot_started"}
         if marker is not None:
             params["marker"] = marker
-        return await self._request("GET", "/updates", params=params)
+        result = await self._request("GET", "/updates", params=params)
+        if result is not None and not isinstance(result, dict):
+            log.error("MAX /updates вернул неожиданный формат: %r", result)
+        return result
 
     async def answer_callback(self, callback_id, notification=None):
         # MAX требует непустое поле message или notification даже для тихого ack.
@@ -1090,8 +1093,16 @@ async def send_offer_screen(chat_id):
 async def handle_message(message):
     sender = (message.get("sender") or {})
     recipient = (message.get("recipient") or {})
-    user_id = sender.get("user_id")
-    chat_id = recipient.get("chat_id") or user_id
+    user_id = sender.get("user_id") or sender.get("id")
+    chat_id = (recipient.get("chat_id") or message.get("chat_id")
+               or recipient.get("user_id") or user_id)
+    try:
+        user_id = int(user_id) if user_id is not None else None
+        chat_id = int(chat_id) if chat_id is not None else None
+    except (TypeError, ValueError):
+        log.warning("Некорректные ID в message_created: sender=%r recipient=%r",
+                    sender, recipient)
+        return
     if not user_id or chat_id is None:
         return
     username = sender.get("username")
@@ -1669,11 +1680,18 @@ async def handle_callback(update):
         payload = str(payload)
 
     callback_user = cb.get("user") or update.get("user") or {}
-    user_id = callback_user.get("user_id")
+    user_id = callback_user.get("user_id") or callback_user.get("id")
     callback_username = callback_user.get("username")
     msg = cb.get("message") or update.get("message") or {}
     recipient = msg.get("recipient") or {}
-    chat_id = recipient.get("chat_id") or update.get("chat_id") or user_id
+    chat_id = (recipient.get("chat_id") or msg.get("chat_id")
+               or update.get("chat_id") or user_id)
+    try:
+        user_id = int(user_id) if user_id is not None else None
+        chat_id = int(chat_id) if chat_id is not None else None
+    except (TypeError, ValueError):
+        log.warning("Некорректные ID callback: %r", update)
+        return
 
     log.info("Callback: payload=%r user=%s chat=%s", payload, user_id, chat_id)
     await remember_user_chat(user_id, chat_id)
@@ -2437,6 +2455,48 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 # ================= ГЛАВНЫЙ ЦИКЛ =================
+async def _handle_bot_started(update):
+    """Обработка нажатия системной кнопки «Старт» в MAX.
+    Форматы bot_started могут отличаться: поддерживаем несколько вариантов полей.
+    """
+    user_obj = (update.get("user") or update.get("sender")
+                or update.get("from") or {})
+    if not isinstance(user_obj, dict):
+        user_obj = {}
+    user_id = (user_obj.get("user_id") or user_obj.get("id")
+               or update.get("user_id") or update.get("sender_id"))
+    msg = update.get("message") or {}
+    recipient = msg.get("recipient") or {}
+    chat_obj = update.get("chat") or {}
+    chat_id = (update.get("chat_id") or recipient.get("chat_id")
+               or msg.get("chat_id") or chat_obj.get("chat_id") or user_id)
+    try:
+        user_id = int(user_id) if user_id is not None else None
+        chat_id = int(chat_id) if chat_id is not None else None
+    except (TypeError, ValueError):
+        log.warning("bot_started: не удалось разобрать ID: %r", update)
+        return
+
+    if chat_id is None:
+        log.warning("bot_started без chat_id: %r", update)
+        return
+
+    if user_id is not None:
+        await remember_user_chat(user_id, chat_id)
+        existing_user = await get_user(user_id)
+        if existing_user and existing_user["agreed_offer"]:
+            st_clear(user_id)
+            await send_menu(chat_id)
+        else:
+            st_set(user_id, "waiting_offer")
+            await send_offer_screen(chat_id)
+    else:
+        # Даже если MAX не прислал user_id, отвечаем в известный чат,
+        # чтобы пользователь не видел полностью молчащий запуск.
+        await send_offer_screen(chat_id)
+    log.info("Обработан bot_started user_id=%s chat_id=%s", user_id, chat_id)
+
+
 async def poll_loop():
     marker = None
     log.info("Бот запущен. Long polling активен.")
@@ -2445,32 +2505,29 @@ async def poll_loop():
         if resp is None:
             await asyncio.sleep(5)
             continue
+        if not isinstance(resp, dict):
+            log.error("Некорректный ответ /updates: %r", resp)
+            await asyncio.sleep(3)
+            continue
         marker = resp.get("marker", marker)
-        for update in resp.get("updates", []):
-            ut = update.get("update_type")
+        updates = resp.get("updates") or []
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            ut = update.get("update_type") or update.get("type")
             try:
                 if ut == "message_created":
                     await handle_message(update.get("message") or {})
                 elif ut == "message_callback":
                     await handle_callback(update)
                 elif ut == "bot_started":
-                    chat_id = update.get("chat_id")
-                    user_id = (update.get("user") or {}).get("user_id")
-                    if chat_id is None:
-                        chat_id = user_id
-                    if chat_id is not None:
-                        if user_id:
-                            await remember_user_chat(user_id, chat_id)
-                        existing_user = await get_user(user_id) if user_id else None
-                        if existing_user and existing_user["agreed_offer"]:
-                            st_clear(user_id)
-                            await send_menu(chat_id)
-                        else:
-                            await send_offer_screen(chat_id)
-                            if user_id:
-                                st_set(user_id, "waiting_offer")
+                    await _handle_bot_started(update)
+                else:
+                    log.info("Пропущено неизвестное обновление type=%r keys=%s",
+                             ut, list(update.keys()))
             except Exception:
-                log.exception("Ошибка обработки обновления: %s", ut)
+                log.exception("Ошибка обработки обновления type=%r update=%r",
+                              ut, update)
 
 async def main():
     if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬ_ТОКЕН":
