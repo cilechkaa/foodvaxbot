@@ -856,9 +856,8 @@ def item_label(item):
 
 def menu_keyboard(items, cat_key):
     buttons = [[cb_btn(item_label(i), f"view:{i['key']}")] for i in items]
-    buttons.append([cb_btn("⬅️ Назад", "back_categories")])
-    buttons.append([cb_btn("🏠 Главное меню", "main_menu")])
     buttons.append([cb_btn("🛒 Корзина", "cart")])
+    buttons.append([cb_btn("🏠 Главное меню", "main_menu")])
     return kb(buttons)
 
 async def item_card_keyboard(user_id, item_key, cat_key):
@@ -1846,6 +1845,16 @@ async def handle_callback(update):
         else:
             await cart_add(user_id, key)
             await ack(f"✅ {item['name']} добавлен в корзину!")
+            # После добавления блюда без гарнира остаёмся в его категории.
+            items = await menu_all(category_key=item["category_key"],
+                                   in_stock_only=True)
+            if items:
+                await api.send(
+                    chat_id, "МЕНЮ",
+                    attachments=[menu_keyboard(items, item["category_key"])]
+                )
+            else:
+                await send_menu(chat_id)
         return
 
     if payload.startswith("garnish:"):
