@@ -805,6 +805,23 @@ class MaxApi:
         return await self._request("GET", "/uploads",
                                    params={"type": token_type})
 
+    async def download_bytes(self, url):
+        """Скачивает вложение MAX по URL и возвращает его содержимое."""
+        if not url:
+            return None
+        try:
+            async with self.session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=30),
+                    ssl=False) as resp:
+                if resp.status != 200:
+                    log.error("Скачивание файла не удалось: %s -> %s",
+                              url, resp.status)
+                    return None
+                return await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            log.exception("Ошибка скачивания файла %s", url)
+            return None
+
     async def upload_bytes(self, data: bytes, token_type: str = "image"):
         info = await self.get_upload_url(token_type)
         if not info or not info.get("url"):
@@ -915,6 +932,7 @@ def admin_panel_keyboard():
         [cb_btn("📈 Топ продаж", "admin:stats")],
         [cb_btn("🖼 Загрузить QR-код", "admin:qr"),
          cb_btn("📊 Загрузить меню Excel", "admin:excel")],
+        [cb_btn("📸 Массовая загрузка фото блюд", "admin:bulk_photos")],
         [cb_btn("💾 Резервная копия БД", "admin:backup")],
         [cb_btn("🗑 Удалить всё меню", "admin:menu_clear_confirm")],
     ])
@@ -1365,6 +1383,90 @@ async def handle_message(message):
         st_clear(user_id)
         await api.send(chat_id, f"✅ Категория «{text}» добавлена.",
                        attachments=[admin_panel_keyboard()])
+        return
+
+    # ===== Массовая загрузка фотографий блюд =====
+    if sname == "admin_bulk_photos":
+        if text.lower() in ("отмена", "cancel"):
+            st_clear(user_id)
+            await api.send(chat_id, "Массовая загрузка фото отменена.",
+                           attachments=[admin_panel_keyboard()])
+            return
+
+        file_attachments = [
+            a for a in (body.get("attachments") or [])
+            if a.get("type") == "file"
+        ]
+        if not file_attachments:
+            await api.send(
+                chat_id,
+                "Пришлите фотографии блюд как файлы-документы (можно несколько "
+                "за раз). Имя каждого файла должно совпадать с названием блюда "
+                "без цены и тире, например: Котлета по-киевски.jpg. "
+                "Для отмены напишите «отмена».")
+            return
+
+        def _photo_name_key(value):
+            value = os.path.basename(str(value or "")).strip()
+            value = re.sub(r"\.(jpg|jpeg|png|webp|gif|bmp)$", "", value,
+                           flags=re.IGNORECASE)
+            # Если в имени всё же указаны тире и цена, отбрасываем эту часть.
+            value = re.sub(r"\s*[-–—]\s*\d.*$", "", value)
+            value = re.sub(r"\s+", " ", value).strip().casefold()
+            return value
+
+        menu_items = await menu_all(active_only=False)
+        menu_by_name = {}
+        ambiguous_names = set()
+        for menu_item in menu_items:
+            name_key = _photo_name_key(menu_item["name"])
+            if not name_key:
+                continue
+            if name_key in menu_by_name:
+                ambiguous_names.add(name_key)
+            else:
+                menu_by_name[name_key] = menu_item
+
+        uploaded = 0
+        skipped = []
+        allowed_extensions = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+        for attachment in file_attachments:
+            payload_file = attachment.get("payload") or {}
+            filename = (payload_file.get("filename") or
+                        payload_file.get("name") or "").strip()
+            file_url = payload_file.get("url")
+            if not filename or not filename.lower().endswith(allowed_extensions):
+                skipped.append(f"{filename or 'Файл без имени'} — нужен файл изображения")
+                continue
+            name_key = _photo_name_key(filename)
+            if name_key in ambiguous_names:
+                skipped.append(f"{filename} — название блюда неоднозначно в меню")
+                continue
+            menu_item = menu_by_name.get(name_key)
+            if not menu_item:
+                skipped.append(f"{filename} — блюдо с таким названием не найдено")
+                continue
+            if not file_url:
+                skipped.append(f"{filename} — MAX не передал ссылку на файл")
+                continue
+            image_bytes = await api.download_bytes(file_url)
+            if not image_bytes:
+                skipped.append(f"{filename} — не удалось скачать файл")
+                continue
+            token = await api.upload_bytes(image_bytes, "image")
+            if not token:
+                skipped.append(f"{filename} — MAX не принял изображение")
+                continue
+            await menu_update(menu_item["key"], "photo_token", token)
+            uploaded += 1
+
+        st_clear(user_id)
+        result = f"✅ Массовая загрузка завершена. Фотографий привязано: {uploaded}."
+        if skipped:
+            result += "\n\nНе обработаны:\n" + "\n".join(skipped[:20])
+            if len(skipped) > 20:
+                result += f"\n…и ещё {len(skipped) - 20} файлов."
+        await api.send(chat_id, result, attachments=[admin_panel_keyboard()])
         return
 
     # ===== Состояния админа: QR-код =====
@@ -2427,6 +2529,20 @@ async def handle_callback(update):
                              f"({row['orders_cnt']} заказов)")
         await ack()
         await api.send(chat_id, "\n".join(lines))
+        return
+
+    if payload == "admin:bulk_photos" and is_admin(user_id):
+        st_set(user_id, "admin_bulk_photos")
+        await ack()
+        await api.send(
+            chat_id,
+            "📸 Отправьте фотографии блюд как файлы-документы (можно несколько "
+            "за раз).\n\n"
+            "Название файла должно совпадать с названием блюда в меню, "
+            "без тире и цены. Например, для блюда «Котлета по-киевски» "
+            "назовите файл «Котлета по-киевски.jpg».\n"
+            "Поддерживаются JPG, JPEG, PNG, WEBP, GIF и BMP.\n"
+            "Для отмены напишите «отмена».")
         return
 
     if payload == "admin:qr" and is_admin(user_id):
