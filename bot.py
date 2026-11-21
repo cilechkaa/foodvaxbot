@@ -1392,10 +1392,15 @@ async def handle_message(message):
             await api.send(chat_id, "Массовая загрузка фото отменена.",
                            attachments=[admin_panel_keyboard()])
             return
+        if text.lower() in ("готово", "завершить", "закончить", "done"):
+            st_clear(user_id)
+            await api.send(chat_id, "✅ Массовая загрузка завершена.",
+                           attachments=[admin_panel_keyboard()])
+            return
 
         file_attachments = [
             a for a in (body.get("attachments") or [])
-            if a.get("type") == "file"
+            if a.get("type") in ("file", "image")
         ]
         if not file_attachments:
             await api.send(
@@ -1432,7 +1437,11 @@ async def handle_message(message):
         allowed_extensions = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
         for attachment in file_attachments:
             payload_file = attachment.get("payload") or {}
-            filename = (payload_file.get("filename") or
+            # В MAX имя файла находится на верхнем уровне attachment.filename,
+            # а не внутри payload. Варианты payload оставлены для совместимости.
+            filename = (attachment.get("filename") or
+                        attachment.get("name") or
+                        payload_file.get("filename") or
                         payload_file.get("name") or "").strip()
             file_url = payload_file.get("url")
             if not filename or not filename.lower().endswith(allowed_extensions):
@@ -1460,13 +1469,13 @@ async def handle_message(message):
             await menu_update(menu_item["key"], "photo_token", token)
             uploaded += 1
 
-        st_clear(user_id)
-        result = f"✅ Массовая загрузка завершена. Фотографий привязано: {uploaded}."
+        result = f"✅ В этой отправке фотографий привязано: {uploaded}."
         if skipped:
             result += "\n\nНе обработаны:\n" + "\n".join(skipped[:20])
             if len(skipped) > 20:
                 result += f"\n…и ещё {len(skipped) - 20} файлов."
-        await api.send(chat_id, result, attachments=[admin_panel_keyboard()])
+        result += "\n\nМожете отправить следующие файлы. Когда закончите, напишите «готово». Для отмены — «отмена»."
+        await api.send(chat_id, result)
         return
 
     # ===== Состояния админа: QR-код =====
