@@ -73,6 +73,9 @@ YOOKASSA_POLL_INTERVAL = 20      # секунд между проверками 
 YOOKASSA_WATCH_HOURS = 12        # сколько часов бот следит за платежом
 YOOKASSA_NAME = "СВОЯ КУХНЯ 89"
 
+# Последняя ошибка API ЮKassa — показывается в админ-панели для диагностики.
+_yk_last_error = None
+
 def yookassa_configured():
     return bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
 
@@ -573,10 +576,14 @@ async def yookassa_create_payment(order_id, amount, description, receipt_items, 
             data = await resp.json(content_type=None)
         if resp.status in (200, 201) and data.get("id"):
             return data
-        log.error("ЮKassa: не удалось создать платёж для заказа #%s: %s %s",
-                  order_id, resp.status, data)
+        err = f"HTTP {resp.status}: {data}"
+        globals()["_yk_last_error"] = err
+        log.error("ЮKassa: не удалось создать платёж для заказа #%s: %s",
+                  order_id, err)
         return None
-    except Exception:
+    except Exception as exc:
+        err = f"сеть/исключение: {exc}"
+        globals()["_yk_last_error"] = err
         log.exception("ЮKassa: ошибка создания платежа для заказа #%s", order_id)
         return None
 
@@ -2262,12 +2269,26 @@ async def finalize_order(chat_id, user_id, username):
             order_id, final_total,
             f"Заказ №{order_id} — {YOOKASSA_NAME}",
             receipt, phone=data.get("phone"))
+        if not payment:
+            # Одна повторная попытка через 2 секунды — сбой мог быть временным.
+            await asyncio.sleep(2)
+            payment = await yookassa_create_payment(
+                order_id, final_total,
+                f"Заказ №{order_id} — {YOOKASSA_NAME}",
+                receipt, phone=data.get("phone"))
         if payment:
             await order_set_payment_id(order_id, payment["id"])
             log.info("ЮKassa: платёж %s создан для заказа #%s", payment["id"], order_id)
         else:
-            log.error("ЮKassa: платёж для заказа #%s не создан — заказ идёт "
-                      "по старому сценарию (QR/кассир)", order_id)
+            # QR-фолбэк при настроенной ЮKassa не выдаём: клиенту — понятное
+            # сообщение, кассиру — точная причина сбоя для диагностики.
+            log.error("ЮKassa: платёж для заказа #%s не создан после повторной "
+                      "попытки — заказ принимается вручную", order_id)
+            await api.notify_staff(
+                f"⚠️ Заказ №{order_id} на {final_total} ₽ принят, но платёж "
+                f"ЮKassa создать не удалось. Последняя ошибка: "
+                f"{_yk_last_error or 'неизвестна'}. "
+                "Свяжитесь с клиентом для оплаты вручную.")
 
     user_text = (
         "✅ Ваш заказ успешно оформлен!\n\n"
@@ -2286,8 +2307,10 @@ async def finalize_order(chat_id, user_id, username):
     if payment:
         user_text += ("📌 **Для оплаты:**\n"
                       "Нажмите кнопку **«Оплатить онлайн»** ниже — карта или СБП.")
-    elif await get_setting("payment_qr"):
-        user_text += "📌 **Для оплаты:**\nОтсканируйте QR-код в следующем сообщении."
+    elif yookassa_configured():
+        user_text += ("⚠️ Онлайн-оплата временно недоступна — заказ на "
+                      f"**{final_total} ₽** принят, кассир свяжется с вами "
+                      "для оплаты.")
     else:
         user_text += ("⚠️ Оплата онлайн не настроена — напишите кассиру, "
                       "он пришлёт реквизиты.")
@@ -2316,7 +2339,8 @@ async def finalize_order(chat_id, user_id, username):
         if pay_msg is None:
             log.error("Не удалось отправить платёжное сообщение для заказа #%s", order_id)
         asyncio.create_task(_yk_watch(order_id, payment["id"]))
-    else:
+    elif not yookassa_configured():
+        # QR выдаём только если ЮKassa не настроена вовсе.
         qr_token = await get_setting("payment_qr")
         if qr_token:
             qr_sent = await api.send(
@@ -3044,6 +3068,15 @@ async def handle_callback(update):
                            "Способ оплаты: ссылка «Оплатить онлайн» (карта/СБП).\n"
                            "Чеки: «Чеки от ЮKassa» (54-ФЗ, АУСН).\n\n"
                            "Бот сам проверяет оплату и переводит заказ в «Оплачен».")
+        elif _yk_last_error:
+            await api.send(chat_id,
+                           f"⚠️ **ЮKassa подключена, но платежи не создаются.**\n"
+                           f"shopId: `{YOOKASSA_SHOP_ID}`\n"
+                           f"Последняя ошибка API: {_yk_last_error}\n\n"
+                           "Типичные причины: отозван/неверен секретный ключ "
+                           "(HTTP 401) или способ приёма платежей не одобрен "
+                           "(HTTP 403).",
+                           attachments=[admin_panel_keyboard()])
         else:
             await api.send(chat_id,
                            "⚠️ **ЮKassa не настроена.**\n"
@@ -3645,6 +3678,7 @@ async def main():
                          "на bothost.ru (MAX_TOKEN / MAX_BOT_TOKEN).")
     await init_db()
     if yookassa_configured():
+        log.info("ЮKassa: переменные окружения обнаружены (shopId %s)", YOOKASSA_SHOP_ID)
         pending = await orders_pending_yookassa()
         for row in pending:
             asyncio.create_task(_yk_watch(int(row["id"]), row["payment_id"]))
