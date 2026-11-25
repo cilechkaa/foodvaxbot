@@ -14,6 +14,7 @@ import sqlite3
 import io
 import re
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -52,11 +53,26 @@ DELIVERY_COST = Decimal("200")
 
 DB_PATH = os.getenv("DB_PATH", "data/shop.db")
 
+# ================= ЮKASSA: НАСТРОЙКИ =================
+# Задаются переменными окружения на bothost.ru:
+#   YOOKASSA_SHOP_ID    — 1535004
+#   YOOKASSA_SECRET_KEY — live_MYCcDMykYsWtDoqENYRBNOmPK0tX4dmnijAlW6ld-Do
+# Пока переменные не заданы, бот работает в прежнем режиме (QR-код / кассир).
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
+YOOKASSA_API_URL = "https://api.yookassa.ru/v3"
+YOOKASSA_POLL_INTERVAL = 20      # секунд между проверками статуса платежа
+YOOKASSA_WATCH_HOURS = 12        # сколько часов бот следит за платежом
+YOOKASSA_NAME = "СВОЯ КУХНЯ 89"
+
+def yookassa_configured():
+    return bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
+
 TZ_YANAO = timezone(timedelta(hours=5))  # ЯНАО = UTC+5
 
 STATUS_LABELS = {
     "new": "🆕 Ожидает оплаты",
-    "paid": "💳 Оплата подтверждена клиентом",
+    "paid": "💳 Оплачен (ЮKassa)",
     "cooking": "👨‍🍳 Готовится",
     "delivering": "🛵 В доставке",
     "done": "✅ Доставлен",
@@ -163,6 +179,12 @@ async def init_db():
                 status TEXT DEFAULT 'new',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+        try:
+            # ID платежа ЮKassa (для обновления со старой базой)
+            await db.execute("ALTER TABLE orders ADD COLUMN payment_id TEXT")
+            await db.commit()
+        except Exception:
+            await db.rollback()
         await db.execute("""
             CREATE TABLE IF NOT EXISTS order_items (
                 order_id INTEGER, item_key TEXT, garnish TEXT,
@@ -443,6 +465,225 @@ async def set_setting(key: str, value: str):
         await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                          (key, value))
         await db.commit()
+
+
+# ================= ЮKASSA: API =================
+_yk_session = None
+
+async def _yk_http():
+    global _yk_session
+    if _yk_session is None or _yk_session.closed:
+        _yk_session = aiohttp.ClientSession()
+    return _yk_session
+
+def _yk_phone(raw):
+    """Приводит телефон к виду +7XXXXXXXXXX или возвращает None."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if len(digits) == 11 and digits[0] == "8":
+        digits = "7" + digits[1:]
+    if len(digits) == 10:
+        digits = "7" + digits
+    if len(digits) == 11 and digits[0] == "7":
+        return "+" + digits
+    return None
+
+def _money(value):
+    return str(Decimal(value).quantize(Decimal("0.01")))
+
+def _yk_build_receipt(receipt_lines, discount_rate, delivery_cost, final_total):
+    """Собирает позиции чека 54-ФЗ: каждое блюдо (со скидкой) + доставка.
+    Сумма позиций чека обязана совпадать с суммой платежа, поэтому последняя
+    крупная позиция корректируется на копейки округления."""
+    if not receipt_lines:
+        return None
+    sums = []
+    for name, qty, price in receipt_lines:
+        sums.append((price * qty * (Decimal("1") - discount_rate))
+                    .quantize(Decimal("0.01")))
+    expected_goods = final_total - delivery_cost
+    diff = (expected_goods - sum(sums)).quantize(Decimal("0.01"))
+    if diff != 0 and max(sums) + diff > 0:
+        sums[sums.index(max(sums))] += diff
+    items = []
+    for (name, qty, price), value in zip(receipt_lines, sums):
+        if value <= 0:
+            # Не удалось корректно распределить — отдаём заказ одной позицией.
+            return [{
+                "description": f"Заказ — {YOOKASSA_NAME}",
+                "quantity": "1.00",
+                "amount": {"value": _money(final_total), "currency": "RUB"},
+                "payment_mode": "full_prepayment",
+                "payment_subject": "commodity",
+                "vat_code": 1,
+            }]
+        items.append({
+            "description": str(name)[:128],
+            "quantity": f"{qty:.2f}",
+            "amount": {"value": _money(value), "currency": "RUB"},
+            "payment_mode": "full_prepayment",
+            "payment_subject": "commodity",
+            "vat_code": 1,  # без НДС
+        })
+    if delivery_cost > 0:
+        items.append({
+            "description": "Доставка заказа",
+            "quantity": "1.00",
+            "amount": {"value": _money(delivery_cost), "currency": "RUB"},
+            "payment_mode": "full_prepayment",
+            "payment_subject": "service",
+            "vat_code": 1,
+        })
+    return items
+
+async def yookassa_create_payment(order_id, amount, description, receipt_items, phone=None):
+    """Создаёт платёж в ЮKassa. Возвращает dict платежа либо None при ошибке."""
+    if not yookassa_configured():
+        return None
+    body = {
+        "amount": {"value": _money(amount), "currency": "RUB"},
+        "capture": True,
+        "confirmation": {"type": "redirect", "return_url": "https://max.ru"},
+        "description": description[:128],
+        "metadata": {"order_id": str(order_id)},
+    }
+    if receipt_items:
+        receipt = {"items": receipt_items, "taxation_system_code": 6}  # 6 = АУСН
+        ph = _yk_phone(phone)
+        if ph:
+            receipt["customer"] = {"phone": ph}
+        body["receipt"] = receipt
+    headers = {"Idempotence-Key": uuid.uuid4().hex, "Content-Type": "application/json"}
+    try:
+        session = await _yk_http()
+        async with session.post(
+            f"{YOOKASSA_API_URL}/payments",
+            json=body,
+            headers=headers,
+            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        if resp.status in (200, 201) and data.get("id"):
+            return data
+        log.error("ЮKassa: не удалось создать платёж для заказа #%s: %s %s",
+                  order_id, resp.status, data)
+        return None
+    except Exception:
+        log.exception("ЮKassa: ошибка создания платежа для заказа #%s", order_id)
+        return None
+
+async def yookassa_get_payment(payment_id):
+    """Возвращает актуальный статус платежа из ЮKassa либо None."""
+    try:
+        session = await _yk_http()
+        async with session.get(
+            f"{YOOKASSA_API_URL}/payments/{payment_id}",
+            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        return data if resp.status == 200 else None
+    except Exception:
+        log.exception("ЮKassa: ошибка запроса платежа %s", payment_id)
+        return None
+
+async def yookassa_cancel_payment(payment_id):
+    try:
+        session = await _yk_http()
+        async with session.post(
+            f"{YOOKASSA_API_URL}/payments/{payment_id}/cancel",
+            headers={"Idempotence-Key": uuid.uuid4().hex},
+            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            return resp.status == 200
+    except Exception:
+        log.exception("ЮKassa: не удалось отменить платёж %s", payment_id)
+        return False
+
+async def _yk_cancel_after_cancel_order(payment_id, order_id):
+    """Если клиент отменил заказ до оплаты — отменяем и платёж в ЮKassa."""
+    payment = await yookassa_get_payment(payment_id)
+    if payment and payment.get("status") == "pending":
+        ok = await yookassa_cancel_payment(payment_id)
+        log.info("ЮKassa: платёж %s отменённого заказа #%s — %s",
+                 payment_id, order_id, "отменён" if ok else "не отменён")
+
+# ================= ЮKASSA: ХРАНЕНИЕ ПЛАТЕЖА В БАЗЕ =================
+async def order_set_payment_id(order_id, payment_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE orders SET payment_id = ? WHERE id = ?",
+                         (payment_id, order_id))
+        await db.commit()
+
+async def orders_pending_yookassa():
+    """Заказы, по которым есть платёж ЮKassa и оплата ещё не подтверждена."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, payment_id FROM orders "
+            "WHERE status = 'new' AND payment_id IS NOT NULL"
+        ) as cur:
+            return await cur.fetchall()
+
+# ================= ЮKASSA: ФОНОВЫЙ КОНТРОЛЬ ОПЛАТЫ =================
+_yk_watching = set()
+
+async def _yk_notify_paid(order_id):
+    order = await order_get(order_id)
+    if not order:
+        return
+    await api.notify_staff(
+        f"💳 Заказ #{order_id} оплачен через ЮKassa!\n"
+        f"Клиент: {order['name']} (@{order['username']}, ID: {order['user_id']})\n"
+        f"Сумма: {order['total']} ₽\n\n"
+        "Заказ можно передавать на кухню.",
+        attachments=[manager_keyboard(order_id, "paid")])
+    try:
+        await api.send_to_user(
+            order["user_id"],
+            f"💳 Оплата заказа #{order_id} подтверждена!\n"
+            "Кассир получил уведомление — начнём готовить. Спасибо!")
+    except Exception:
+        log.exception("Не удалось уведомить клиента об оплате заказа #%s", order_id)
+
+async def _yk_watch(order_id, payment_id):
+    """Раз в YOOKASSA_POLL_INTERVAL секунд проверяет статус платежа в ЮKassa.
+    При успехе сам переводит заказ в статус «оплачен» и уведомляет клиента и кассира.
+    Переживает перезапуск бота: незавершённые платежи подхватываются в main()."""
+    if order_id in _yk_watching:
+        return
+    _yk_watching.add(order_id)
+    try:
+        deadline = asyncio.get_event_loop().time() + YOOKASSA_WATCH_HOURS * 3600
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(YOOKASSA_POLL_INTERVAL)
+            payment = await yookassa_get_payment(payment_id)
+            if not payment:
+                continue
+            status = payment.get("status")
+            if status == "succeeded":
+                order = await order_get(order_id)
+                if order and order["status"] == "new":
+                    await order_set_status(order_id, "paid")
+                    log.info("ЮKassa: заказ #%s оплачен (платёж %s)", order_id, payment_id)
+                    await _yk_notify_paid(order_id)
+                return
+            if status == "canceled":
+                order = await order_get(order_id)
+                if order and order["status"] == "new":
+                    try:
+                        await api.send_to_user(
+                            order["user_id"],
+                            f"❌ Платёж по заказу #{order_id} не завершён или отменён.\n"
+                            "Оформите заказ заново или напишите кассиру.",
+                            attachments=[kb([[cb_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
+                    except Exception:
+                        log.exception("Не удалось уведомить об отмене платежа #%s", order_id)
+                return
+        log.info("ЮKassa: наблюдение за платежом %s заказа #%s истекло", payment_id, order_id)
+    finally:
+        _yk_watching.discard(order_id)
 
 # ================= КАТЕГОРИИ И МЕНЮ =================
 async def categories_all():
@@ -1114,7 +1355,7 @@ def admin_panel_keyboard():
         [cb_btn("🧹 Сбросить все заказы", "admin:orders_clear_confirm")],
         [cb_btn("📦 Остатки / стоп-лист", "admin:stock")],
         [cb_btn("📈 Топ продаж", "admin:stats")],
-        [cb_btn("🖼 Загрузить QR-код", "admin:qr"),
+        [cb_btn("💳 Оплата (ЮKassa)", "admin:yk"),
          cb_btn("📊 Загрузить меню Excel", "admin:excel")],
         [cb_btn("📸 Массовая загрузка фото блюд", "admin:bulk_photos")],
         [cb_btn("💾 Резервная копия БД", "admin:backup")],
@@ -1922,7 +2163,7 @@ async def finalize_order(chat_id, user_id, username):
                     data.get("phone", "—"), data.get("address", "—"))
 
     garnishes = await get_all_garnishes(user_id)
-    lines, total = [], Decimal("0")
+    lines, receipt_lines, total = [], [], Decimal("0")
     missing = []
     for key, qty in rows:
         item_key, _ = parse_cart_key(key)
@@ -1933,6 +2174,7 @@ async def finalize_order(chat_id, user_id, username):
         pos_sum = Decimal(item["price"]) * qty
         total += pos_sum
         lines.append(f"• {item['name']} ({qty} шт.) — {pos_sum} ₽")
+        receipt_lines.append((item["name"], Decimal(qty), Decimal(item["price"])))
         garnish = garnishes.get(key)
         if garnish:
             lines.append(f"   Гарнир: {GARNISH_LABELS.get(garnish, garnish)}")
@@ -1974,6 +2216,7 @@ async def finalize_order(chat_id, user_id, username):
         delivery_cost = DELIVERY_COST
         delivery_note = f"🚚 Доставка: {delivery_cost} ₽"
     final_total = base + delivery_cost
+    discount_rate = (discount_sum / total) if total > 0 else Decimal("0")
 
     order_id = await order_save(user_id, username or "—", data, items_text,
                                 final_total,
@@ -2003,6 +2246,21 @@ async def finalize_order(chat_id, user_id, username):
                   "сотруднику. Проверьте ID кассира/админа и запуск бота в их чате.",
                   order_id)
 
+    # ===== Создание платежа ЮKassa =====
+    payment = None
+    if yookassa_configured():
+        receipt = _yk_build_receipt(receipt_lines, discount_rate, delivery_cost, final_total)
+        payment = await yookassa_create_payment(
+            order_id, final_total,
+            f"Заказ №{order_id} — {YOOKASSA_NAME}",
+            receipt, phone=data.get("phone"))
+        if payment:
+            await order_set_payment_id(order_id, payment["id"])
+            log.info("ЮKassa: платёж %s создан для заказа #%s", payment["id"], order_id)
+        else:
+            log.error("ЮKassa: платёж для заказа #%s не создан — заказ идёт "
+                      "по старому сценарию (QR/кассир)", order_id)
+
     user_text = (
         "✅ Ваш заказ успешно оформлен!\n\n"
         f"Имя: {data.get('name')}\n"
@@ -2016,41 +2274,59 @@ async def finalize_order(chat_id, user_id, username):
         f"{delivery_note}\n"
         f"💰 **Итого: {final_total} ₽**\n\n"
         f"{bonus_text}\n\n"
-        f"📌 **Для оплаты:**\n"
-        f"Отсканируйте QR-код ниже и оплатите заказ."
     )
-    buttons = [
-        [link_btn("💬 Написать кассиру", MANAGER_USERNAME)],
-        [cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")],
-    ]
+    if payment:
+        user_text += ("📌 **Для оплаты:**\n"
+                      "Нажмите кнопку **«Оплатить онлайн»** ниже — карта или СБП.")
+    elif await get_setting("payment_qr"):
+        user_text += "📌 **Для оплаты:**\nОтсканируйте QR-код в следующем сообщении."
+    else:
+        user_text += ("⚠️ Оплата онлайн не настроена — напишите кассиру, "
+                      "он пришлёт реквизиты.")
+
+    buttons = []
+    if payment:
+        buttons.append([link_btn("💳 Оплатить онлайн",
+                                 payment["confirmation"]["confirmation_url"])])
+    buttons.append([link_btn("💬 Написать кассиру", MANAGER_USERNAME)])
+    buttons.append([cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")])
     customer_result = await api.send(chat_id, user_text, attachments=[kb(buttons)])
     if customer_result is None:
         log.error("Заказ #%s сохранён, но клиентское подтверждение не доставлено chat_id=%s", order_id, chat_id)
     else:
         log.info("Подтверждение заказа #%s доставлено user_id=%s chat_id=%s", order_id, user_id, chat_id)
 
-    qr_token = await get_setting("payment_qr")
-    if qr_token:
-        qr_sent = await api.send(
+    if payment:
+        pay_msg = await api.send(
             chat_id,
             "💳 **Оплата заказа**\n"
             f"Сумма: **{final_total} ₽**\n\n"
-            "Отсканируйте QR-код и оплатите заказ. После оплаты нажмите «Я оплатил».",
-            attachments=[photo_attachment(qr_token),
-                         kb([[cb_btn("✅ Я оплатил", f"paid:{order_id}")],
+            "Нажмите **«Оплатить онлайн»** выше — карта или СБП.\n"
+            "Бот сам увидит оплату и передаст заказ на кухню.",
+            attachments=[kb([[cb_btn("🔄 Проверить оплату", f"paid:{order_id}")],
                              [cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")]])])
-        if qr_sent is None:
-            log.error("Не удалось отправить QR-код клиенту для заказа #%s", order_id)
-            await api.send(chat_id,
-                           "⚠️ Не удалось отправить QR-код. Напишите кассиру, "
-                           "чтобы получить реквизиты для оплаты.",
-                           attachments=[kb([[cb_btn("💬 Написать кассиру", "contact_manager")]])])
+        if pay_msg is None:
+            log.error("Не удалось отправить платёжное сообщение для заказа #%s", order_id)
+        asyncio.create_task(_yk_watch(order_id, payment["id"]))
     else:
-        log.error("Не задан payment_qr: заказ #%s оформлен без QR-кода", order_id)
-        await api.send(chat_id,
-                       "⚠️ QR-код для оплаты пока не настроен. Напишите кассиру, "
-                       "чтобы получить реквизиты для оплаты.",
-                       attachments=[kb([[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
+        qr_token = await get_setting("payment_qr")
+        if qr_token:
+            qr_sent = await api.send(
+                chat_id,
+                "💳 **Оплата заказа**\n"
+                f"Сумма: **{final_total} ₽**\n\n"
+                "Отсканируйте QR-код и оплатите заказ. После оплаты нажмите «Я оплатил».",
+                attachments=[photo_attachment(qr_token),
+                             kb([[cb_btn("✅ Я оплатил", f"paid:{order_id}")],
+                                 [cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")]])])
+            if qr_sent is None:
+                log.error("Не удалось отправить QR-код клиенту для заказа #%s", order_id)
+        else:
+            log.error("ЮKassa недоступна и QR-код не задан: заказ #%s без способа оплаты", order_id)
+            await api.send(chat_id,
+                           "⚠️ Оплата пока не настроена. Напишите кассиру, "
+                           "чтобы получить реквизиты для оплаты.",
+                           attachments=[kb([[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
 
     if not manager_sent:
         log.critical("Не удалось доставить уведомление о заказе #%s. Текст заказа:\n%s",
@@ -2671,6 +2947,9 @@ async def handle_callback(update):
             await ack("Заказ уже перешёл в приготовление или был изменён")
             return
         await decrement_order_count(user_id)
+        if yookassa_configured() and order["payment_id"]:
+            asyncio.create_task(_yk_cancel_after_cancel_order(
+                order["payment_id"], order_id))
         await ack("Заказ отменён")
         await api.send(chat_id, "❌ Ваш заказ отменён. Если потребуется, вы можете оформить новый.",
                        attachments=[kb([[cb_btn("🏠 Главное меню", "main_menu")]])])
@@ -2696,6 +2975,35 @@ async def handle_callback(update):
         if order["status"] in ("paid", "cooking", "delivering", "done"):
             await ack("Оплата уже отмечена")
             return
+        if yookassa_configured() and order["payment_id"]:
+            payment = await yookassa_get_payment(order["payment_id"])
+            pay_status = (payment or {}).get("status")
+            if pay_status == "succeeded":
+                await order_set_status(order_id, "paid")
+                await ack("Оплата подтверждена!")
+                await api.send(chat_id,
+                               "💳 Оплата заказа подтверждена!\n"
+                               "Заказ передаётся на кухню. Спасибо!")
+                await api.notify_staff(
+                    f"💳 Заказ #{order_id} оплачен через ЮKassa (проверено по кнопке).\n"
+                    f"Клиент: {order['name']} (@{order['username']}, ID: {order['user_id']})\n"
+                    f"Сумма: {order['total']} ₽\n\n"
+                    "Заказ можно передавать на кухню.",
+                    attachments=[manager_keyboard(order_id, "paid")])
+            elif pay_status == "canceled":
+                await ack("Платёж не завершён")
+                await api.send(chat_id,
+                               "❌ Платёж по заказу не завершён или отменён.\n"
+                               "Оформите заказ заново или напишите кассиру.",
+                               attachments=[kb([[cb_btn("💬 Написать кассиру", "contact_manager")]])])
+            else:
+                await ack("Оплата пока не поступила")
+                await api.send(chat_id,
+                               "⏳ Оплата пока не поступила.\n"
+                               "Если вы только что оплатили — подождите минуту "
+                               "и нажмите «Проверить оплату» ещё раз.")
+            return
+        # Резервный сценарий (без ЮKassa): клиент подтверждает оплату кассиру.
         await order_set_status(order_id, "paid")
         await ack("Спасибо! Сообщение об оплате отправлено кассиру.")
         await api.send(chat_id,
@@ -2717,6 +3025,26 @@ async def handle_callback(update):
         st_clear(user_id)
         await ack()
         await api.send(chat_id, "Отменено.", attachments=[admin_panel_keyboard()])
+        return
+
+    if payload == "admin:yk" and is_admin(user_id):
+        await ack()
+        if yookassa_configured():
+            await api.send(chat_id,
+                           "💳 **ЮKassa подключена.**\n"
+                           f"shopId: `{YOOKASSA_SHOP_ID}`\n"
+                           "Способ оплаты: ссылка «Оплатить онлайн» (карта/СБП).\n"
+                           "Чеки: «Чеки от ЮKassa» (54-ФЗ, АУСН).\n\n"
+                           "Бот сам проверяет оплату и переводит заказ в «Оплачен».")
+        else:
+            await api.send(chat_id,
+                           "⚠️ **ЮKassa не настроена.**\n"
+                           "Добавьте переменные окружения на bothost.ru:\n"
+                           "`YOOKASSA_SHOP_ID` и `YOOKASSA_SECRET_KEY` "
+                           "(значения — из кабинета ЮKassa).\n\n"
+                           "Пока их нет, заказы работают по старому сценарию "
+                           "(QR-код/кассир).",
+                           attachments=[admin_panel_keyboard()])
         return
 
     if payload == "admin:menu_clear_confirm" and is_admin(user_id):
@@ -3308,6 +3636,12 @@ async def main():
         raise SystemExit("Не задан MAX_BOT_TOKEN — добавьте переменную окружения "
                          "на bothost.ru (MAX_TOKEN / MAX_BOT_TOKEN).")
     await init_db()
+    if yookassa_configured():
+        pending = await orders_pending_yookassa()
+        for row in pending:
+            asyncio.create_task(_yk_watch(int(row["id"]), row["payment_id"]))
+        if pending:
+            log.info("ЮKassa: возобновлён контроль %d незавершённых платежей", len(pending))
     await api.start()
     me = await api._request("GET", "/me")
     if me:
