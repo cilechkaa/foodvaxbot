@@ -1413,7 +1413,7 @@ async def cart_text_and_keyboard(user_id):
     if total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
         missing = MIN_ORDER_AMOUNT - total
         text += f"\n⚠️ Минимальный заказ: {MIN_ORDER_AMOUNT} ₽. Добавьте ещё на {missing} ₽"
-    elif total < FREE_DELIVERY_FROM:
+    elif total < FREE_DELIVERY_FROM and not is_admin_user(user_id):
         missing = FREE_DELIVERY_FROM - total
         text += (f"\n🚚 Доставка {DELIVERY_COST} ₽. Добавьте ещё на {missing} ₽ — "
                  f"и доставка бесплатная!")
@@ -2210,7 +2210,7 @@ async def finalize_order(chat_id, user_id, username):
                       f"Спасибо, что вы с нами!")
 
     base = total - discount_sum
-    if base >= FREE_DELIVERY_FROM:
+    if is_admin_user(user_id) or base >= FREE_DELIVERY_FROM:
         delivery_cost = Decimal("0")
         delivery_note = "🚚 Доставка: бесплатно"
     else:
