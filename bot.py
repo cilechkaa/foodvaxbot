@@ -568,6 +568,15 @@ def _yk_phone(raw):
 def _money(value):
     return str(Decimal(value).quantize(Decimal("0.01")))
 
+def _yk_auth_headers(extra=None):
+    """Заголовки с Basic-авторизацией для API ЮKassa.
+    aiohttp.BasicAuth устарел и будет удалён в 4.0 — используем заголовок Authorization."""
+    headers = {"Authorization": aiohttp.encode_basic_auth(
+        YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY).decode()}
+    if extra:
+        headers.update(extra)
+    return headers
+
 def _yk_build_receipt(receipt_lines, discount_rate, delivery_cost, final_total):
     """Собирает позиции чека 54-ФЗ: каждое блюдо (со скидкой) + доставка.
     Сумма позиций чека обязана совпадать с суммой платежа, поэтому последняя
@@ -596,7 +605,7 @@ def _yk_build_receipt(receipt_lines, discount_rate, delivery_cost, final_total):
             }]
         items.append({
             "description": str(name)[:128],
-            "quantity": f"{qty:.2f}",
+            "quantity": "1.00",  # одна расчётная позиция на всю строку (amount = полная сумма позиции)
             "amount": {"value": _money(value), "currency": "RUB"},
             "payment_mode": "full_prepayment",
             "payment_subject": "commodity",
@@ -611,6 +620,19 @@ def _yk_build_receipt(receipt_lines, discount_rate, delivery_cost, final_total):
             "payment_subject": "service",
             "vat_code": 1,
         })
+    # Финальная проверка: сумма позиций чека обязана совпасть с суммой платежа.
+    items_sum = sum(Decimal(i["amount"]["value"]) * Decimal(i["quantity"]) for i in items)
+    if items_sum != Decimal(final_total).quantize(Decimal("0.01")):
+        log.warning("ЮKassa: суммы чека (%s) и платежа (%s) разошлись — чек одной позицией",
+                    items_sum, Decimal(final_total).quantize(Decimal("0.01")))
+        return [{
+            "description": f"Заказ — {YOOKASSA_NAME}",
+            "quantity": "1.00",
+            "amount": {"value": _money(final_total), "currency": "RUB"},
+            "payment_mode": "full_prepayment",
+            "payment_subject": "commodity",
+            "vat_code": 1,
+        }]
     return items
 
 async def yookassa_create_payment(order_id, amount, description, receipt_items, phone=None):
@@ -638,8 +660,7 @@ async def yookassa_create_payment(order_id, amount, description, receipt_items, 
         async with session.post(
             f"{YOOKASSA_API_URL}/payments",
             json=body,
-            headers=headers,
-            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            headers=_yk_auth_headers(headers),
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             data = await resp.json(content_type=None)
@@ -658,7 +679,7 @@ async def yookassa_get_payment(payment_id):
         session = await _yk_http()
         async with session.get(
             f"{YOOKASSA_API_URL}/payments/{payment_id}",
-            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            headers=_yk_auth_headers(),
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             data = await resp.json(content_type=None)
@@ -672,8 +693,7 @@ async def yookassa_cancel_payment(payment_id):
         session = await _yk_http()
         async with session.post(
             f"{YOOKASSA_API_URL}/payments/{payment_id}/cancel",
-            headers={"Idempotence-Key": uuid.uuid4().hex},
-            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            headers=_yk_auth_headers({"Idempotence-Key": uuid.uuid4().hex}),
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             return resp.status == 200
