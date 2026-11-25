@@ -627,8 +627,10 @@ async def yookassa_create_payment(order_id, amount, description, receipt_items, 
     if receipt_items:
         receipt = {"items": receipt_items, "taxation_system_code": 6}  # 6 = АУСН
         ph = _yk_phone(phone)
-        if ph:
-            receipt["customer"] = {"phone": ph}
+        if not ph:
+            log.error("ЮKassa: для заказа #%s не передан корректный телефон покупателя", order_id)
+            return None
+        receipt["customer"] = {"phone": ph}
         body["receipt"] = receipt
     headers = {"Idempotence-Key": uuid.uuid4().hex, "Content-Type": "application/json"}
     try:
@@ -2235,16 +2237,16 @@ async def handle_message(message):
 
     # ===== Оформление заказа: имя/телефон/адрес/время/комментарий =====
     if sname == "edit_phone":
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) < 10:
-            await api.send(chat_id, "Некорректный номер. Введите ещё раз:")
+        normalized_phone = _yk_phone(text)
+        if not normalized_phone:
+            await api.send(chat_id, "Некорректный номер. Введите российский номер в формате +7XXXXXXXXXX:")
             return
         user = await get_user(user_id)
         name = user["name"] if user and user["name"] else "Гость"
         address = user["address"] if user and user["address"] else "—"
-        await save_user(user_id, name, text, address)
+        await save_user(user_id, name, normalized_phone, address)
         st_clear(user_id)
-        await api.send(chat_id, f"✅ Телефон сохранён: {text}")
+        await api.send(chat_id, f"✅ Телефон сохранён: {normalized_phone}")
         return
 
     if sname == "edit_address":
@@ -2257,6 +2259,22 @@ async def handle_message(message):
         await save_user(user_id, name, phone, text)
         st_clear(user_id)
         await api.send(chat_id, f"✅ Адрес сохранён: {text}")
+        return
+
+    if sname == "waiting_phone_payment":
+        normalized_phone = _yk_phone(text)
+        if not normalized_phone:
+            await api.send(chat_id, "Некорректный номер. Введите российский номер в формате +7XXXXXXXXXX:")
+            return
+        data = st_data(user_id)
+        data["phone"] = normalized_phone
+        user = await get_user(user_id)
+        name = data.get("name") or (user["name"] if user and user["name"] else "Гость")
+        address = data.get("address") or (user["address"] if user and user["address"] else "—")
+        await save_user(user_id, name, normalized_phone, address)
+        st_set(user_id, "waiting_comment", **data)
+        await api.send(chat_id, "✅ Телефон сохранён. Продолжаю оформление заказа.")
+        await finalize_order(chat_id, user_id, username)
         return
 
     if sname == "waiting_name":
@@ -2274,15 +2292,15 @@ async def handle_message(message):
         return
 
     if sname == "waiting_phone":
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) < 10:
-            await api.send(chat_id, "Некорректный номер. Введите ещё раз:")
+        normalized_phone = _yk_phone(text)
+        if not normalized_phone:
+            await api.send(chat_id, "Некорректный номер. Введите российский номер в формате +7XXXXXXXXXX:")
             return
         data = st_data(user_id)
-        data["phone"] = text
+        data["phone"] = normalized_phone
         user = await get_user(user_id)
         address = user["address"] if user and user["address"] else "—"
-        await save_user(user_id, data.get("name", "Гость"), text, address)
+        await save_user(user_id, data.get("name", "Гость"), normalized_phone, address)
         st_set(user_id, "waiting_address", **data)
         await api.send(chat_id, "Укажите адрес доставки:")
         return
@@ -2353,8 +2371,22 @@ async def finalize_order(chat_id, user_id, username):
         st_clear(user_id)
         return
 
+    normalized_phone = _yk_phone(data.get("phone"))
+    if not normalized_phone:
+        user = await get_user(user_id)
+        data["phone"] = user["phone"] if user and user["phone"] else ""
+        normalized_phone = _yk_phone(data["phone"])
+    if not normalized_phone:
+        st_set(user_id, "waiting_phone_payment", **data)
+        await api.send(
+            chat_id,
+            "Для фискального чека ЮKassa нужен корректный номер телефона. "
+            "Введите номер в формате +7XXXXXXXXXX:"
+        )
+        return
+    data["phone"] = normalized_phone
     await save_user(user_id, data.get("name", "—"),
-                    data.get("phone", "—"), data.get("address", "—"))
+                    normalized_phone, data.get("address", "—"))
 
     garnishes = await get_all_garnishes(user_id)
     lines, receipt_lines, total = [], [], Decimal("0")
