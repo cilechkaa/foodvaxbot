@@ -1382,6 +1382,12 @@ def admin_item_keyboard(key, active):
         [cb_btn(toggle_label, f"atoggle:{key}:{toggle_action}")],
     ])
 
+def is_test_product(item):
+    """Тестовый товар за 1 рубль: для него доставка не начисляется."""
+    return (str(item.get("name", "")).strip().casefold() == "тест"
+            and Decimal(str(item.get("price", "0"))) == Decimal("1"))
+
+
 async def cart_text_and_keyboard(user_id):
     rows = await cart_get(user_id)
     if not rows:
@@ -1389,6 +1395,7 @@ async def cart_text_and_keyboard(user_id):
 
     lines, kb_buttons = [], []
     total = Decimal("0")
+    only_test_products = True
     garnishes = await get_all_garnishes(user_id)
 
     for key, qty in rows:
@@ -1396,6 +1403,8 @@ async def cart_text_and_keyboard(user_id):
         item = await menu_get(item_key)
         if not item:
             continue
+        if not is_test_product(item):
+            only_test_products = False
         subtotal = Decimal(item["price"]) * qty
         total += subtotal
         lines.append(f"• {item['name']} ({qty} шт.) — {subtotal} ₽")
@@ -1410,7 +1419,9 @@ async def cart_text_and_keyboard(user_id):
 
     text = "🛒 Ваша корзина:\n" + "\n".join(lines) + f"\n\nИтого: {total} ₽"
 
-    if total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
+    if only_test_products:
+        text += "\n🚚 Доставка для тестового товара бесплатная!"
+    elif total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
         missing = MIN_ORDER_AMOUNT - total
         text += f"\n⚠️ Минимальный заказ: {MIN_ORDER_AMOUNT} ₽. Добавьте ещё на {missing} ₽"
     elif total < FREE_DELIVERY_FROM and not is_admin_user(user_id):
@@ -2210,7 +2221,11 @@ async def finalize_order(chat_id, user_id, username):
                       f"Спасибо, что вы с нами!")
 
     base = total - discount_sum
-    if is_admin_user(user_id) or base >= FREE_DELIVERY_FROM:
+    only_test_products = all(
+        name.strip().casefold() == "тест" and price == Decimal("1")
+        for name, qty, price in receipt_lines
+    )
+    if only_test_products or is_admin_user(user_id) or base >= FREE_DELIVERY_FROM:
         delivery_cost = Decimal("0")
         delivery_note = "🚚 Доставка: бесплатно"
     else:
