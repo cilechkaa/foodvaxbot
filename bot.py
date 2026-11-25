@@ -557,8 +557,6 @@ async def _yk_http():
 def _yk_phone(raw):
     """Приводит телефон к виду +7XXXXXXXXXX или возвращает None."""
     digits = re.sub(r"\D", "", str(raw or ""))
-    if len(digits) == 12 and digits.startswith("78"):
-        digits = digits[1:]  # ввели «+7 8 999…» — убираем лишнюю цифру
     if len(digits) == 11 and digits[0] == "8":
         digits = "7" + digits[1:]
     if len(digits) == 10:
@@ -566,9 +564,6 @@ def _yk_phone(raw):
     if len(digits) == 11 and digits[0] == "7":
         return "+" + digits
     return None
-
-PHONE_PROMPT = ("Укажите номер телефона. Начните с +7, например: +79991234567\n"
-                "(если введёте 8… или просто 10 цифр — бот сам заменит на +7)")
 
 def _money(value):
     return str(Decimal(value).quantize(Decimal("0.01")))
@@ -1808,15 +1803,8 @@ async def handle_message(message):
         await api.send(chat_id, "✅ Личный чат кассира зарегистрирован. Этот чат будет использоваться для новых заказов.")
         return
 
-    if text.startswith("/courier"):
-        st_clear(user_id)
-        if await courier_is(user_id):
-            await api.send(chat_id, "🛵 Вход выполнен. Панель курьера:",
-                           attachments=[courier_panel_keyboard()])
-        else:
-            await api.send(chat_id,
-                           "Нет доступа: вы не добавлены как курьер.\n"
-                           f"Ваш ID: `{user_id}` — передайте его администратору.")
+    if text.startswith("/courier") and await courier_is(user_id):
+        await api.send(chat_id, "🛵 Панель курьера:", attachments=[courier_panel_keyboard()])
         return
 
     if text.startswith("/offer"):
@@ -2300,7 +2288,7 @@ async def handle_message(message):
         address = user["address"] if user and user["address"] else "—"
         await save_user(user_id, text, phone, address)
         st_set(user_id, "waiting_phone", **data)
-        await api.send(chat_id, PHONE_PROMPT)
+        await api.send(chat_id, "Укажите номер телефона:")
         return
 
     if sname == "waiting_phone":
@@ -2314,7 +2302,7 @@ async def handle_message(message):
         address = user["address"] if user and user["address"] else "—"
         await save_user(user_id, data.get("name", "Гость"), normalized_phone, address)
         st_set(user_id, "waiting_address", **data)
-        await api.send(chat_id, f"✅ Телефон: {normalized_phone}\nУкажите адрес доставки:")
+        await api.send(chat_id, "Укажите адрес доставки:")
         return
 
     if sname == "waiting_address":
@@ -2632,8 +2620,7 @@ async def handle_callback(update):
         return
 
     user = await get_user(user_id)
-    courier_access = payload.startswith("courier:") and await courier_is(user_id)
-    if (not user or not user["agreed_offer"]) and not courier_access:
+    if not user or not user["agreed_offer"]:
         await ack("Сначала согласитесь с офертой: /start")
         return
 
@@ -2830,7 +2817,7 @@ async def handle_callback(update):
         if not user["phone"] or user["phone"] == "—":
             st_set(user_id, "waiting_phone", **data)
             await ack()
-            await api.send(chat_id, PHONE_PROMPT)
+            await api.send(chat_id, "Укажите номер телефона:")
             return
         data["phone"] = user["phone"]
         if not user["address"] or user["address"] == "—":
@@ -2870,7 +2857,7 @@ async def handle_callback(update):
     if payload == "edit_phone":
         st_set(user_id, "edit_phone")
         await ack()
-        await api.send(chat_id, PHONE_PROMPT)
+        await api.send(chat_id, "Введите новый номер телефона:")
         return
 
     if payload == "edit_address":
