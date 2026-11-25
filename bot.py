@@ -55,8 +55,8 @@ DB_PATH = os.getenv("DB_PATH", "data/shop.db")
 
 # ================= ЮKASSA: НАСТРОЙКИ =================
 # Задаются переменными окружения на bothost.ru:
-#   YOOKASSA_SHOP_ID    — 1535004
-#   YOOKASSA_SECRET_KEY — <укажи в переменных окружения хостинга>
+#   YOOKASSA_SHOP_ID    — идентификатор магазина (shopId) из личного кабинета ЮKassa
+#   YOOKASSA_SECRET_KEY — секретный ключ из кабинета ЮKassa (Настройки → Ключи API)
 # Пока переменные не заданы, бот работает в прежнем режиме (QR-код / кассир).
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
