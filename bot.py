@@ -1513,20 +1513,36 @@ def admin_item_keyboard(key, active):
         [cb_btn(toggle_label, f"atoggle:{key}:{toggle_action}")],
     ])
 
+def _item_field(item, field, default=None):
+    """Безопасно читает поле из sqlite3.Row, dict и других mapping-объектов."""
+    if item is None:
+        return default
+    try:
+        return item[field]
+    except (KeyError, IndexError, TypeError):
+        pass
+    # Не вызываем .get(): sqlite3.Row этого метода не имеет.
+    try:
+        keys = item.keys()
+        if field in keys:
+            return item[field]
+    except (AttributeError, TypeError, KeyError, IndexError):
+        pass
+    if isinstance(item, dict) and field in item:
+        return item[field]
+    return default
+
+
 def is_test_product(item):
-    """Тестовый товар за 1 рубль: поддерживает sqlite3.Row и dict."""
+    """True только для товара «Тест» стоимостью ровно 1 рубль."""
     if item is None:
         return False
-    try:
-        name = item["name"]
-        price = item["price"]
-    except (KeyError, IndexError, TypeError):
-        name = item.get("name", "") if hasattr(item, "get") else ""
-        price = item.get("price", "0") if hasattr(item, "get") else "0"
+    name = _item_field(item, "name", "")
+    price = _item_field(item, "price", "0")
     try:
         return (str(name).strip().casefold() == "тест"
-                and Decimal(str(price)) == Decimal("1"))
-    except Exception:
+                and Decimal(str(price).strip().replace(",", ".")) == Decimal("1"))
+    except (InvalidOperation, TypeError, ValueError):
         return False
 
 
@@ -2396,8 +2412,7 @@ async def finalize_order(chat_id, user_id, username):
 
     base = total - discount_sum
     only_test_products = bool(receipt_lines) and all(
-        str(name).strip().casefold() == "тест"
-        and Decimal(str(price)) == Decimal("1")
+        is_test_product({"name": name, "price": price})
         for name, qty, price in receipt_lines
     )
     if only_test_products or is_admin_user(user_id) or base >= FREE_DELIVERY_FROM:
