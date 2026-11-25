@@ -15,6 +15,7 @@ import io
 import re
 import json
 import uuid
+import base64
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -554,6 +555,11 @@ async def _yk_http():
         _yk_session = aiohttp.ClientSession()
     return _yk_session
 
+def _yk_auth_header():
+    """Заголовок Authorization для API ЮKassa (aiohttp.BasicAuth устарел)."""
+    token = base64.b64encode(f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode()).decode()
+    return "Basic " + token
+
 def _yk_phone(raw):
     """Приводит телефон к виду +7XXXXXXXXXX или возвращает None."""
     digits = re.sub(r"\D", "", str(raw or ""))
@@ -597,14 +603,23 @@ def _yk_build_receipt(receipt_lines, discount_rate, delivery_cost, final_total):
         items.append({
             "description": str(name)[:128],
             # amount.value в чеке — цена за единицу; ЮKassa умножает её на
-            # quantity. Отдаём одну позицию на всю сумму строки, чтобы чек
-            # гарантированно сошёлся с суммой платежа.
+            # quantity. Одна строка корзины = один расчёт на полную сумму.
             "quantity": "1.00",
             "amount": {"value": _money(value), "currency": "RUB"},
             "payment_mode": "full_prepayment",
             "payment_subject": "commodity",
             "vat_code": 1,  # без НДС
         })
+    if (sum(sums) + delivery_cost).quantize(Decimal("0.01")) != final_total:
+        # Суммы разошлись — отдаём весь заказ одной позицией на итог платежа.
+        return [{
+            "description": f"Заказ — {YOOKASSA_NAME}",
+            "quantity": "1.00",
+            "amount": {"value": _money(final_total), "currency": "RUB"},
+            "payment_mode": "full_prepayment",
+            "payment_subject": "commodity",
+            "vat_code": 1,
+        }]
     if delivery_cost > 0:
         items.append({
             "description": "Доставка заказа",
@@ -635,11 +650,8 @@ async def yookassa_create_payment(order_id, amount, description, receipt_items, 
             return None
         receipt["customer"] = {"phone": ph}
         body["receipt"] = receipt
-    headers = {
-        "Idempotence-Key": uuid.uuid4().hex,
-        "Content-Type": "application/json",
-        "Authorization": aiohttp.encode_basic_auth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
-    }
+    headers = {"Idempotence-Key": uuid.uuid4().hex, "Content-Type": "application/json",
+               "Authorization": _yk_auth_header()}
     try:
         session = await _yk_http()
         async with session.post(
@@ -664,7 +676,7 @@ async def yookassa_get_payment(payment_id):
         session = await _yk_http()
         async with session.get(
             f"{YOOKASSA_API_URL}/payments/{payment_id}",
-            headers={"Authorization": aiohttp.encode_basic_auth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)},
+            headers={"Authorization": _yk_auth_header()},
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             data = await resp.json(content_type=None)
@@ -678,10 +690,8 @@ async def yookassa_cancel_payment(payment_id):
         session = await _yk_http()
         async with session.post(
             f"{YOOKASSA_API_URL}/payments/{payment_id}/cancel",
-            headers={
-                "Idempotence-Key": uuid.uuid4().hex,
-                "Authorization": aiohttp.encode_basic_auth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
-            },
+            headers={"Idempotence-Key": uuid.uuid4().hex,
+                     "Authorization": _yk_auth_header()},
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             return resp.status == 200
