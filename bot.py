@@ -50,9 +50,10 @@ DISCOUNT_PERCENT = Decimal("50")
 MIN_ORDER_AMOUNT = Decimal("900")
 
 def is_admin_user(user_id):
-    """True, если заказ оформляет администратор (для него минималка не действует)."""
+    """True для администратора или настроенного кассира."""
     try:
-        return int(user_id) in ADMIN_IDS
+        uid = int(user_id)
+        return uid in ADMIN_IDS or uid == int(MANAGER_CHAT_ID)
     except (TypeError, ValueError):
         return False
 
@@ -1493,8 +1494,7 @@ def admin_panel_keyboard():
         [cb_btn("🧹 Сбросить все заказы", "admin:orders_clear_confirm")],
         [cb_btn("📦 Остатки / стоп-лист", "admin:stock")],
         [cb_btn("📈 Топ продаж", "admin:stats")],
-        [cb_btn("💳 Оплата (ЮKassa)", "admin:yk"),
-         cb_btn("📊 Загрузить меню Excel", "admin:excel")],
+        [cb_btn("📊 Загрузить меню Excel", "admin:excel")],
         [cb_btn("📸 Массовая загрузка фото блюд", "admin:bulk_photos")],
         [cb_btn("💾 Резервная копия БД", "admin:backup")],
         [cb_btn("🗑 Удалить всё меню", "admin:menu_clear_confirm")],
@@ -2384,8 +2384,9 @@ async def finalize_order(chat_id, user_id, username):
                       f"Спасибо, что вы с нами!")
 
     base = total - discount_sum
-    only_test_products = all(
-        name.strip().casefold() == "тест" and price == Decimal("1")
+    only_test_products = bool(receipt_lines) and all(
+        str(name).strip().casefold() == "тест"
+        and Decimal(str(price)) == Decimal("1")
         for name, qty, price in receipt_lines
     )
     if only_test_products or is_admin_user(user_id) or base >= FREE_DELIVERY_FROM:
@@ -2460,18 +2461,18 @@ async def finalize_order(chat_id, user_id, username):
                   order_id)
 
     user_text = (
-        "✅ Ваш заказ оформлен! Остался последний шаг — оплатить его через ЮKassa.\\n\\n"
-        f"Имя: {data.get('name')}\\n"
-        f"Адрес: {data.get('address')}\\n"
-        f"⏰ Время доставки: {data.get('delivery_time', '—')}\\n"
-        f"{items_text}\\n\\n"
+        "✅ Ваш заказ оформлен! Остался последний шаг — оплатить его через ЮKassa.\n\n"
+        f"Имя: {data.get('name')}\n"
+        f"Адрес: {data.get('address')}\n"
+        f"⏰ Время доставки: {data.get('delivery_time', '—')}\n"
+        f"{items_text}\n\n"
     )
     if discount_note:
-        user_text += f"{discount_note}\\n"
+        user_text += f"{discount_note}\n"
     user_text += (
-        f"{delivery_note}\\n"
-        f"💰 **Итого: {final_total} ₽**\\n\\n"
-        f"{bonus_text}\\n\\n"
+        f"{delivery_note}\n"
+        f"💰 **Итого: {final_total} ₽**\n\n"
+        f"{bonus_text}\n\n"
         "После успешной оплаты бот автоматически подтвердит платёж."
     )
 
@@ -2487,8 +2488,8 @@ async def finalize_order(chat_id, user_id, username):
 
     pay_msg = await api.send(
         chat_id,
-        "💳 **Оплата через ЮKassa**\\n"
-        f"Сумма: **{final_total} ₽**\\n\\n"
+        "💳 **Оплата через ЮKassa**\n"
+        f"Сумма: **{final_total} ₽**\n\n"
         "Нажмите кнопку «Оплатить через ЮKassa». Доступные способы оплаты "
         "покажет платёжная страница. После оплаты статус обновится автоматически.",
         attachments=[kb([
