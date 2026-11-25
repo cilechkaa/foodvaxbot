@@ -50,9 +50,10 @@ DISCOUNT_PERCENT = Decimal("50")
 MIN_ORDER_AMOUNT = Decimal("900")
 
 def is_admin_user(user_id):
-    """True, если заказ оформляет администратор (для него минималка не действует)."""
+    """True для администратора или настроенного кассира."""
     try:
-        return int(user_id) in ADMIN_IDS
+        uid = int(user_id)
+        return uid in ADMIN_IDS or uid == int(MANAGER_CHAT_ID)
     except (TypeError, ValueError):
         return False
 
@@ -216,6 +217,17 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS couriers (
+                user_id INTEGER PRIMARY KEY,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS courier_order_messages (
+                order_id INTEGER NOT NULL, courier_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL, message_id TEXT,
+                PRIMARY KEY(order_id, courier_id)
+            )""")
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS user_chats (
                 user_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -232,19 +244,6 @@ async def init_db():
                 state TEXT,
                 data TEXT NOT NULL DEFAULT '{}',
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS couriers (
-                user_id INTEGER PRIMARY KEY,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS courier_order_messages (
-                order_id INTEGER NOT NULL,
-                courier_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                message_id TEXT,
-                PRIMARY KEY (order_id, courier_id)
             )""")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS dish_ratings (
@@ -281,9 +280,7 @@ async def init_db():
                          ("created_at", "TIMESTAMP"),
                          ("username", "TEXT"),
                          ("delivery_time", "TEXT"),
-                         ("courier_id", "INTEGER"),
-                         ("courier_stage", "TEXT DEFAULT ''"),
-                         ("courier_notified", "INTEGER DEFAULT 0")]:
+                         ("courier_id", "INTEGER")]:
             if col not in ocols:
                 await db.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
 
@@ -434,6 +431,63 @@ async def user_chat_id(user_id: int):
         async with db.execute("SELECT chat_id FROM user_chats WHERE user_id=?", (int(user_id),)) as cur:
             row = await cur.fetchone()
             return int(row[0]) if row else None
+
+async def courier_ids():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM couriers ORDER BY added_at") as cur:
+            return [int(row[0]) for row in await cur.fetchall()]
+
+async def courier_add(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO couriers(user_id) VALUES(?)", (int(user_id),))
+        await db.commit()
+
+async def courier_remove(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM couriers WHERE user_id=?", (int(user_id),))
+        await db.commit()
+
+async def courier_is(user_id: int) -> bool:
+    if is_manager(user_id):
+        return True
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM couriers WHERE user_id=?", (int(user_id),)) as cur:
+            return await cur.fetchone() is not None
+
+async def courier_claim_order(order_id: int, courier_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE orders SET courier_id=? WHERE id=? AND courier_id IS NULL AND status='paid'",
+            (int(courier_id), int(order_id)))
+        await db.commit()
+        return cur.rowcount == 1
+
+async def courier_set_order_status(order_id: int, courier_id: int, status: str) -> bool:
+    allowed = "status IN ('paid','cooking','delivering')" if status == "delivering" else "status='delivering'"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            f"UPDATE orders SET status=? WHERE id=? AND courier_id=? AND {allowed}",
+            (status, int(order_id), int(courier_id)))
+        await db.commit()
+        return cur.rowcount == 1
+
+async def courier_store_message(order_id, courier_id, chat_id, message_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO courier_order_messages(order_id,courier_id,chat_id,message_id) VALUES(?,?,?,?)",
+                         (int(order_id), int(courier_id), int(chat_id), str(message_id) if message_id else None))
+        await db.commit()
+
+async def courier_messages(order_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM courier_order_messages WHERE order_id=?", (int(order_id),)) as cur:
+            return await cur.fetchall()
+
+async def courier_active_orders(courier_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM orders WHERE courier_id=? AND status IN ('paid','cooking','delivering') ORDER BY id DESC", (int(courier_id),)) as cur:
+            return await cur.fetchall()
 
 async def addresses_get(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -652,6 +706,54 @@ async def orders_pending_yookassa():
 
 # ================= ЮKASSA: ФОНОВЫЙ КОНТРОЛЬ ОПЛАТЫ =================
 _yk_watching = set()
+
+def _extract_message_id(result):
+    """Достаёт идентификатор сообщения из ответа MAX API."""
+    if not isinstance(result, dict):
+        return None
+    for key in ("message_id", "mid"):
+        if result.get(key) is not None:
+            return result[key]
+    for key in ("message", "body", "result"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            found = _extract_message_id(value)
+            if found is not None:
+                return found
+    return None
+
+async def courier_notify_order(order_id):
+    order = await order_get(order_id)
+    if not order or order["status"] != "paid" or order["courier_id"]:
+        return
+    for courier_id in await courier_ids():
+        # Не отправляем дубликаты при повторной проверке платежа.
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT 1 FROM courier_order_messages WHERE order_id=? AND courier_id=?",
+                                  (order_id, courier_id)) as cur:
+                if await cur.fetchone():
+                    continue
+        chat_id = await user_chat_id(courier_id)
+        if not chat_id:
+            log.warning("Курьер %s ещё не открыл бота командой /start", courier_id)
+            continue
+        text = (f"🛵 **Новый заказ #{order_id}**\n"
+                f"Сумма: {order['total']} ₽\n"
+                f"Клиент: {order['name']}\nТелефон: {order['phone']}\n"
+                f"Адрес: {order['address']}\nВремя: {order['delivery_time']}\n"
+                f"Комментарий: {order['comment'] or '—'}\n\n"
+                f"{order['items']}")
+        result = await api.send(chat_id, text, attachments=[courier_take_keyboard(order_id)])
+        if result is not None:
+            await courier_store_message(order_id, courier_id, chat_id, _extract_message_id(result))
+
+async def courier_hide_order_from_others(order_id, assigned_courier_id):
+    for row in await courier_messages(order_id):
+        if int(row["courier_id"]) == int(assigned_courier_id):
+            continue
+        if row["message_id"]:
+            await api.edit(int(row["chat_id"]), row["message_id"],
+                           f"🚫 Заказ #{order_id} уже забрал другой курьер.", attachments=[])
 
 async def _yk_notify_paid(order_id):
     order = await order_get(order_id)
@@ -954,159 +1056,6 @@ async def order_set_status(order_id, status):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
         await db.commit()
-
-# ================= КУРЬЕРЫ =================
-async def courier_add(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("INSERT OR IGNORE INTO couriers(user_id) VALUES (?)", (int(user_id),))
-        await db.commit()
-        return cur.rowcount == 1
-
-
-async def courier_remove(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("DELETE FROM couriers WHERE user_id=?", (int(user_id),))
-        await db.commit()
-        return cur.rowcount == 1
-
-
-async def courier_ids():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM couriers ORDER BY user_id") as cur:
-            return [int(row[0]) for row in await cur.fetchall()]
-
-
-async def courier_is(user_id):
-    if is_manager(user_id):
-        return True
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM couriers WHERE user_id=?", (int(user_id),)) as cur:
-            return await cur.fetchone() is not None
-
-
-async def courier_claim_order(order_id, courier_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE orders SET courier_id=?, courier_stage='assigned' "
-            "WHERE id=? AND courier_id IS NULL AND status IN ('paid','cooking')",
-            (int(courier_id), int(order_id)))
-        await db.commit()
-        return cur.rowcount == 1
-
-
-async def courier_set_stage(order_id, courier_id, stage):
-    async with aiosqlite.connect(DB_PATH) as db:
-        if stage == "picked_up":
-            cur = await db.execute(
-                "UPDATE orders SET courier_stage='picked_up', status='delivering' "
-                "WHERE id=? AND courier_id=? AND courier_stage='assigned'",
-                (int(order_id), int(courier_id)))
-        elif stage == "done":
-            cur = await db.execute(
-                "UPDATE orders SET courier_stage='done', status='done' "
-                "WHERE id=? AND courier_id=? AND courier_stage='picked_up'",
-                (int(order_id), int(courier_id)))
-        else:
-            return False
-        await db.commit()
-        return cur.rowcount == 1
-
-
-async def courier_active_orders(courier_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM orders WHERE courier_id=? AND status IN ('paid','cooking','delivering') "
-            "ORDER BY id DESC", (int(courier_id),)) as cur:
-            return await cur.fetchall()
-
-
-async def courier_store_message(order_id, courier_id, chat_id, message_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO courier_order_messages(order_id,courier_id,chat_id,message_id) "
-            "VALUES (?,?,?,?)",
-            (int(order_id), int(courier_id), int(chat_id),
-             str(message_id) if message_id is not None else None))
-        await db.commit()
-
-
-async def courier_order_messages(order_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT courier_id,chat_id,message_id FROM courier_order_messages WHERE order_id=?",
-            (int(order_id),)) as cur:
-            return await cur.fetchall()
-
-
-def _extract_message_id(data):
-    if isinstance(data, dict):
-        for key in ("message_id", "mid"):
-            if data.get(key) is not None:
-                return data[key]
-        for value in data.values():
-            found = _extract_message_id(value)
-            if found is not None:
-                return found
-    elif isinstance(data, list):
-        for value in data:
-            found = _extract_message_id(value)
-            if found is not None:
-                return found
-    return None
-
-
-async def courier_notify_order(order_id):
-    registered_couriers = await courier_ids()
-    if not registered_couriers:
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE orders SET courier_notified=1 WHERE id=? "
-            "AND status IN ('paid','cooking') AND courier_id IS NULL "
-            "AND COALESCE(courier_notified,0)=0", (int(order_id),))
-        await db.commit()
-        if cur.rowcount != 1:
-            return
-    order = await order_get(order_id)
-    if not order:
-        return
-    message = (
-        f"🆕 **Новый оплаченный заказ #{order_id}**\n"
-        f"Сумма: {order['total']} ₽\nИмя: {order['name']}\n"
-        f"Телефон: {order['phone']}\nАдрес: {order['address']}\n"
-        f"Время: {order['delivery_time']}\n"
-        f"Комментарий: {order['comment'] or '—'}\n\n{order['items']}"
-    )
-    for courier_id in registered_couriers:
-        target_chat = await user_chat_id(courier_id)
-        if target_chat is None:
-            log.warning("Курьер %s не запускал бота; /start нужен для доставки заказов", courier_id)
-            continue
-        result = await api.send(
-            target_chat, message,
-            attachments=[kb([[cb_btn("🛵 Взять заказ", f"courier:take:{order_id}")]])])
-        await courier_store_message(order_id, courier_id, target_chat,
-                                     _extract_message_id(result))
-
-
-async def courier_refresh_order_messages(order_id, assigned_courier_id):
-    order = await order_get(order_id)
-    if not order:
-        return
-    for courier_id, chat_id, message_id in await courier_order_messages(order_id):
-        if not message_id:
-            continue
-        if int(courier_id) == int(assigned_courier_id):
-            body = (f"🛵 **Заказ #{order_id} закреплён за вами**\n"
-                    f"Адрес: {order['address']}\nТелефон: {order['phone']}\n"
-                    f"Сумма: {order['total']} ₽")
-            attachments = [kb([[cb_btn("📦 Забрал заказ", f"courier:picked:{order_id}")]])]
-        else:
-            body = f"Заказ #{order_id} уже забрал другой курьер."
-            attachments = []
-        await api.edit(int(chat_id), message_id, body, attachments=attachments)
-
 
 async def order_cancel_if_allowed(order_id, user_id):
     """Атомарно отменяет заказ клиента только до начала приготовления."""
@@ -1511,6 +1460,18 @@ def manager_keyboard(order_id, status):
                for label, next_status in transitions.get(status, [])]
     return kb(buttons)
 
+def courier_take_keyboard(order_id):
+    return kb([[cb_btn("🛵 Взять заказ", f"courier:take:{order_id}")]])
+
+def courier_progress_keyboard(order_id):
+    return kb([[cb_btn("📦 Забрал заказ", f"courier:picked:{order_id}")]])
+
+def courier_deliver_keyboard(order_id):
+    return kb([[cb_btn("✅ Доставил заказ", f"courier:delivered:{order_id}")]])
+
+def courier_panel_keyboard():
+    return kb([[cb_btn("📦 Мои активные заказы", "courier:active")]])
+
 def manager_panel_keyboard():
     return kb([
         [cb_btn("🆕 Ожидают оплаты", "mgr:new")],
@@ -1533,8 +1494,7 @@ def admin_panel_keyboard():
         [cb_btn("🧹 Сбросить все заказы", "admin:orders_clear_confirm")],
         [cb_btn("📦 Остатки / стоп-лист", "admin:stock")],
         [cb_btn("📈 Топ продаж", "admin:stats")],
-        [cb_btn("💳 Оплата (ЮKassa)", "admin:yk"),
-         cb_btn("📊 Загрузить меню Excel", "admin:excel")],
+        [cb_btn("📊 Загрузить меню Excel", "admin:excel")],
         [cb_btn("📸 Массовая загрузка фото блюд", "admin:bulk_photos")],
         [cb_btn("💾 Резервная копия БД", "admin:backup")],
         [cb_btn("🗑 Удалить всё меню", "admin:menu_clear_confirm")],
@@ -1553,6 +1513,23 @@ def admin_item_keyboard(key, active):
         [cb_btn(toggle_label, f"atoggle:{key}:{toggle_action}")],
     ])
 
+def is_test_product(item):
+    """Тестовый товар за 1 рубль: поддерживает sqlite3.Row и dict."""
+    if item is None:
+        return False
+    try:
+        name = item["name"]
+        price = item["price"]
+    except (KeyError, IndexError, TypeError):
+        name = item.get("name", "") if hasattr(item, "get") else ""
+        price = item.get("price", "0") if hasattr(item, "get") else "0"
+    try:
+        return (str(name).strip().casefold() == "тест"
+                and Decimal(str(price)) == Decimal("1"))
+    except Exception:
+        return False
+
+
 async def cart_text_and_keyboard(user_id):
     rows = await cart_get(user_id)
     if not rows:
@@ -1560,6 +1537,7 @@ async def cart_text_and_keyboard(user_id):
 
     lines, kb_buttons = [], []
     total = Decimal("0")
+    only_test_products = True
     garnishes = await get_all_garnishes(user_id)
 
     for key, qty in rows:
@@ -1567,6 +1545,8 @@ async def cart_text_and_keyboard(user_id):
         item = await menu_get(item_key)
         if not item:
             continue
+        if not is_test_product(item):
+            only_test_products = False
         subtotal = Decimal(item["price"]) * qty
         total += subtotal
         lines.append(f"• {item['name']} ({qty} шт.) — {subtotal} ₽")
@@ -1581,7 +1561,9 @@ async def cart_text_and_keyboard(user_id):
 
     text = "🛒 Ваша корзина:\n" + "\n".join(lines) + f"\n\nИтого: {total} ₽"
 
-    if total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
+    if only_test_products:
+        text += "\n🚚 Доставка для тестового товара бесплатная!"
+    elif total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
         missing = MIN_ORDER_AMOUNT - total
         text += f"\n⚠️ Минимальный заказ: {MIN_ORDER_AMOUNT} ₽. Добавьте ещё на {missing} ₽"
     elif total < FREE_DELIVERY_FROM and not is_admin_user(user_id):
@@ -1803,6 +1785,10 @@ async def handle_message(message):
         await api.send(chat_id, "✅ Личный чат кассира зарегистрирован. Этот чат будет использоваться для новых заказов.")
         return
 
+    if text.startswith("/courier") and await courier_is(user_id):
+        await api.send(chat_id, "🛵 Панель курьера:", attachments=[courier_panel_keyboard()])
+        return
+
     if text.startswith("/offer"):
         await api.send(
             chat_id,
@@ -1826,28 +1812,6 @@ async def handle_message(message):
         else:
             await api.send(chat_id, "Нет доступа.")
         st_clear(user_id)
-        return
-
-    if text.startswith("/courier"):
-        if not await courier_is(user_id):
-            await api.send(chat_id, "У вас нет доступа к панели курьера.")
-            return
-        orders = await courier_active_orders(user_id)
-        if not orders:
-            await api.send(chat_id, "Активных заказов у вас нет.")
-            return
-        for order in orders:
-            if order["courier_stage"] == "assigned":
-                buttons = [[cb_btn("📦 Забрал заказ", f"courier:picked:{order['id']}")]]
-            elif order["courier_stage"] == "picked_up":
-                buttons = [[cb_btn("✅ Доставил заказ", f"courier:done:{order['id']}")]]
-            else:
-                buttons = []
-            await api.send(
-                chat_id,
-                f"Заказ #{order['id']}\nАдрес: {order['address']}\n"
-                f"Телефон: {order['phone']}\nСумма: {order['total']} ₽",
-                attachments=[kb(buttons)] if buttons else None)
         return
 
     if text.startswith("/admin"):
@@ -1953,6 +1917,34 @@ async def handle_message(message):
         return
 
     # ===== Состояния админа: кассир и переименование категории =====
+    if sname == "admin_courier_id" and text:
+        raw_id = text.strip()
+        if not raw_id.isdigit() or int(raw_id) <= 0:
+            await api.send(chat_id, "Введите положительный числовой MAX ID курьера:")
+            return
+        courier_id = int(raw_id)
+        if is_admin(courier_id):
+            await api.send(chat_id, "Этот пользователь уже администратор. Введите ID другого курьера:")
+            return
+        await courier_add(courier_id)
+        st_clear(user_id)
+        await api.send(chat_id,
+                       f"✅ Курьер {courier_id} добавлен. Попросите его открыть бота и отправить /start, чтобы получать заказы.",
+                       attachments=[admin_panel_keyboard()])
+        return
+
+    if sname == "admin_courier_remove_id" and text:
+        raw_id = text.strip()
+        if not raw_id.isdigit() or int(raw_id) <= 0:
+            await api.send(chat_id, "Введите положительный числовой MAX ID курьера:")
+            return
+        courier_id = int(raw_id)
+        await courier_remove(courier_id)
+        st_clear(user_id)
+        await api.send(chat_id, f"✅ Курьер {courier_id} удалён из списка уведомлений.",
+                       attachments=[admin_panel_keyboard()])
+        return
+
     if sname == "admin_manager_id" and text:
         raw_id = text.strip()
         if not raw_id.isdigit():
@@ -1970,37 +1962,6 @@ async def handle_message(message):
                        f"✅ ID кассира сохранён: {manager_id}.\n"
                        "Убедитесь, что кассир уже отправил боту /start — иначе MAX "
                        "не разрешит боту написать ему первым.",
-                       attachments=[admin_panel_keyboard()])
-        return
-
-    if sname == "admin_courier_add" and text:
-        try:
-            courier_id = int(text.strip())
-            if courier_id <= 0:
-                raise ValueError
-        except ValueError:
-            await api.send(chat_id, "Введите корректный числовой ID курьера:")
-            return
-        added = await courier_add(courier_id)
-        st_clear(user_id)
-        await api.send(
-            chat_id,
-            "✅ Курьер добавлен. Теперь он должен открыть бота и отправить /start, "
-            "чтобы получать новые заказы." if added else "Этот ID уже есть в списке курьеров.",
-            attachments=[admin_panel_keyboard()])
-        return
-
-    if sname == "admin_courier_remove" and text:
-        try:
-            courier_id = int(text.strip())
-            if courier_id <= 0:
-                raise ValueError
-        except ValueError:
-            await api.send(chat_id, "Введите корректный числовой ID курьера:")
-            return
-        removed = await courier_remove(courier_id)
-        st_clear(user_id)
-        await api.send(chat_id, "✅ Курьер удалён." if removed else "Курьер с таким ID не найден.",
                        attachments=[admin_panel_keyboard()])
         return
 
@@ -2434,12 +2395,12 @@ async def finalize_order(chat_id, user_id, username):
                       f"Спасибо, что вы с нами!")
 
     base = total - discount_sum
-    test_only_order = bool(receipt_lines) and all(
-        "тест" in str(name).strip().casefold()
+    only_test_products = bool(receipt_lines) and all(
+        str(name).strip().casefold() == "тест"
         and Decimal(str(price)) == Decimal("1")
         for name, qty, price in receipt_lines
     )
-    if test_only_order or is_admin_user(user_id) or base >= FREE_DELIVERY_FROM:
+    if only_test_products or is_admin_user(user_id) or base >= FREE_DELIVERY_FROM:
         delivery_cost = Decimal("0")
         delivery_note = "🚚 Доставка: бесплатно"
     else:
@@ -2591,54 +2552,6 @@ async def handle_callback(update):
     if not user_id or chat_id is None:
         log.warning("Callback без user_id/chat_id: %r", update)
         await ack("Не удалось определить пользователя. Напишите /start.")
-        return
-
-    if payload.startswith("courier:"):
-        parts = payload.split(":")
-        if len(parts) != 3 or not await courier_is(user_id):
-            await ack("Нет доступа")
-            return
-        action = parts[1]
-        try:
-            order_id = int(parts[2])
-        except ValueError:
-            await ack("Некорректный номер заказа")
-            return
-        order = await order_get(order_id)
-        if not order:
-            await ack("Заказ не найден")
-            return
-        if action == "take":
-            if not await courier_claim_order(order_id, user_id):
-                await ack("Заказ уже взят другим курьером или недоступен")
-                return
-            await ack("Заказ закреплён за вами")
-            await courier_refresh_order_messages(order_id, user_id)
-            await api.send_to_user(order["user_id"],
-                                   f"🛵 Курьер назначен на ваш заказ #{order_id}.")
-            return
-        if int(order["courier_id"] or 0) != int(user_id):
-            await ack("Заказ закреплён за другим курьером")
-            return
-        if action == "picked":
-            if not await courier_set_stage(order_id, user_id, "picked_up"):
-                await ack("Сначала возьмите заказ")
-                return
-            await ack("Отмечено: забрал заказ")
-            await api.send_to_user(order["user_id"],
-                                   f"🛵 Курьер забрал заказ #{order_id} и выехал к вам.")
-            await api.send(chat_id, f"Заказ #{order_id}: после вручения нажмите кнопку.",
-                           attachments=[kb([[cb_btn("✅ Доставил заказ", f"courier:done:{order_id}")]])])
-            return
-        if action == "done":
-            if not await courier_set_stage(order_id, user_id, "done"):
-                await ack("Сначала отметьте, что забрали заказ")
-                return
-            await ack("Заказ доставлен")
-            await api.send_to_user(order["user_id"], f"✅ Ваш заказ #{order_id} доставлен. Спасибо!")
-            await api.send(chat_id, f"✅ Заказ #{order_id} завершён.")
-            return
-        await ack("Неизвестное действие")
         return
 
     if payload == "agree_offer":
@@ -3006,6 +2919,81 @@ async def handle_callback(update):
                 "Если вы только что оплатили, подождите немного и проверьте снова.")
         return
 
+    if payload.startswith("courier:"):
+        parts = payload.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if not await courier_is(user_id):
+            await ack("Нет доступа: вы не добавлены как курьер")
+            return
+        if action == "active":
+            orders = await courier_active_orders(user_id)
+            await ack()
+            if not orders:
+                await api.send(chat_id, "Активных заказов у вас нет.", attachments=[courier_panel_keyboard()])
+                return
+            for o in orders:
+                text = (f"📦 **Ваш заказ #{o['id']}**\nСумма: {o['total']} ₽\n"
+                        f"Клиент: {o['name']}\nТелефон: {o['phone']}\n"
+                        f"Адрес: {o['address']}\nВремя: {o['delivery_time']}\n"
+                        f"Статус: {STATUS_LABELS.get(o['status'], o['status'])}")
+                keyboard = courier_deliver_keyboard(o['id']) if o['status'] == 'delivering' else courier_progress_keyboard(o['id'])
+                await api.send(chat_id, text, attachments=[keyboard])
+            return
+        if len(parts) != 3 or not parts[2].isdigit():
+            await ack("Некорректный заказ")
+            return
+        order_id = int(parts[2])
+        order = await order_get(order_id)
+        if not order:
+            await ack("Заказ не найден")
+            return
+        if action == "take":
+            claimed = await courier_claim_order(order_id, user_id)
+            if not claimed:
+                await ack("Заказ уже взят или недоступен")
+                failed_msg = cb.get("message") or {}
+                failed_mid = _extract_message_id(failed_msg)
+                if failed_mid:
+                    await api.edit(chat_id, failed_mid,
+                                   f"🚫 Заказ #{order_id} уже занят или недоступен.", attachments=[])
+                return
+            await ack("Заказ закреплён за вами")
+            await courier_hide_order_from_others(order_id, user_id)
+            current_mid = _extract_message_id(msg)
+            if current_mid:
+                await api.edit(chat_id, current_mid,
+                               f"🛵 **Вы взяли заказ #{order_id}**\nАдрес: {order['address']}\nТелефон: {order['phone']}",
+                               attachments=[courier_progress_keyboard(order_id)])
+            return
+        if int(order["courier_id"] or 0) != int(user_id):
+            await ack("Этот заказ закреплён за другим курьером")
+            return
+        if action == "picked":
+            if await courier_set_order_status(order_id, user_id, "delivering"):
+                await ack("Отмечено: заказ забран")
+                await api.send_to_user(order["user_id"], f"📦 Заказ #{order_id} забран курьером и направляется к вам.")
+                current_mid = _extract_message_id(msg)
+                if current_mid:
+                    await api.edit(chat_id, current_mid,
+                                   f"📦 **Заказ #{order_id} забран.**\nАдрес: {order['address']}",
+                                   attachments=[courier_deliver_keyboard(order_id)])
+            else:
+                await ack("Не удалось изменить статус заказа")
+            return
+        if action == "delivered":
+            if await courier_set_order_status(order_id, user_id, "done"):
+                await ack("Заказ отмечен доставленным")
+                await api.send_to_user(order["user_id"], f"✅ Заказ #{order_id} доставлен. Спасибо за заказ!")
+                current_mid = _extract_message_id(msg)
+                if current_mid:
+                    await api.edit(chat_id, current_mid,
+                                   f"✅ **Заказ #{order_id} доставлен.**", attachments=[])
+            else:
+                await ack("Не удалось изменить статус заказа")
+            return
+        await ack("Неизвестное действие")
+        return
+
     if payload.startswith("setstatus:"):
         if not is_manager(user_id):
             await ack("Нет доступа")
@@ -3105,33 +3093,33 @@ async def handle_callback(update):
                            attachments=[kb(buttons)])
             return
 
+        if action == "couriers":
+            ids = await courier_ids()
+            buttons = [[cb_btn("➕ Добавить курьера", "admin:courier_add")],
+                       [cb_btn("➖ Удалить курьера", "admin:courier_remove")],
+                       [cb_btn("🔄 Обновить список", "admin:couriers")],
+                       [cb_btn("⬅️ В админ-панель", "admin:back")]]
+            listing = "\n".join(f"• {cid}" for cid in ids) if ids else "Пока курьеров нет."
+            await ack()
+            await api.send(chat_id, "🛵 **Курьеры**\n" + listing, attachments=[kb(buttons)])
+            return
+
+        if action == "courier_add":
+            st_set(user_id, "admin_courier_id")
+            await ack()
+            await api.send(chat_id, "Введите MAX ID курьера (узнать можно командой /myid):")
+            return
+
+        if action == "courier_remove":
+            st_set(user_id, "admin_courier_remove_id")
+            await ack()
+            await api.send(chat_id, "Введите MAX ID курьера, которого нужно удалить:")
+            return
+
         if action == "manager_id":
             st_set(user_id, "admin_manager_id")
             await ack()
             await api.send(chat_id, "Введите числовой ID кассира (из /myid):")
-            return
-
-        if action == "couriers":
-            ids = await courier_ids()
-            listing = "\n".join(f"• `{cid}`" for cid in ids) if ids else "Список пока пуст."
-            await ack()
-            await api.send(chat_id, "🛵 **Курьеры:**\n" + listing, attachments=[kb([
-                [cb_btn("➕ Добавить курьера", "admin:courier_add")],
-                [cb_btn("➖ Удалить курьера", "admin:courier_remove")],
-                [cb_btn("⬅️ В админ-панель", "admin:back")],
-            ])])
-            return
-
-        if action == "courier_add":
-            st_set(user_id, "admin_courier_add")
-            await ack()
-            await api.send(chat_id, "Введите MAX ID курьера (команда /myid):")
-            return
-
-        if action == "courier_remove":
-            st_set(user_id, "admin_courier_remove")
-            await ack()
-            await api.send(chat_id, "Введите MAX ID курьера для удаления:")
             return
 
         if action == "orders":
