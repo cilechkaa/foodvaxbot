@@ -557,6 +557,8 @@ async def _yk_http():
 def _yk_phone(raw):
     """Приводит телефон к виду +7XXXXXXXXXX или возвращает None."""
     digits = re.sub(r"\D", "", str(raw or ""))
+    if len(digits) == 12 and digits.startswith("78"):
+        digits = digits[1:]  # ввели «+7 8 999…» — убираем лишнюю цифру
     if len(digits) == 11 and digits[0] == "8":
         digits = "7" + digits[1:]
     if len(digits) == 10:
@@ -565,39 +567,58 @@ def _yk_phone(raw):
         return "+" + digits
     return None
 
+PHONE_PROMPT = ("Укажите номер телефона. Начните с +7, например: +79991234567\n"
+                "(если введёте 8… или просто 10 цифр — бот сам заменит на +7)")
+
 def _money(value):
     return str(Decimal(value).quantize(Decimal("0.01")))
 
 def _yk_build_receipt(receipt_lines, discount_rate, delivery_cost, final_total):
     """Собирает позиции чека 54-ФЗ: каждое блюдо (со скидкой) + доставка.
-    Сумма позиций чека обязана совпадать с суммой платежа, поэтому последняя
-    крупная позиция корректируется на копейки округления."""
+    В ЮKassa поле amount — это цена ЗА ОДНУ ШТУКУ, а общая сумма позиции =
+    amount * quantity. Сумма всех позиций обязана совпадать с суммой платежа,
+    поэтому копеечную разницу округления переносим на одну штуку."""
     if not receipt_lines:
         return None
-    sums = []
+    one = Decimal("1")
+    cent = Decimal("0.01")
+
+    def single_item():
+        return [{
+            "description": f"Заказ — {YOOKASSA_NAME}",
+            "quantity": "1.00",
+            "amount": {"value": _money(final_total), "currency": "RUB"},
+            "payment_mode": "full_prepayment",
+            "payment_subject": "commodity",
+            "vat_code": 1,
+        }]
+
+    lines = []  # [название, количество, цена за штуку]
     for name, qty, price in receipt_lines:
-        sums.append((price * qty * (Decimal("1") - discount_rate))
-                    .quantize(Decimal("0.01")))
+        unit = (price * (one - discount_rate)).quantize(cent)
+        lines.append([name, qty, unit])
     expected_goods = final_total - delivery_cost
-    diff = (expected_goods - sum(sums)).quantize(Decimal("0.01"))
-    if diff != 0 and max(sums) + diff > 0:
-        sums[sums.index(max(sums))] += diff
+    diff = (expected_goods - sum(l[2] * l[1] for l in lines)).quantize(cent)
+    if diff != 0:
+        target = next((l for l in lines if l[1] == 1 and l[2] + diff > 0), None)
+        if target is not None:
+            target[2] += diff
+        else:
+            # Количество больше 1: отделяем одну штуку и правим цену только у неё.
+            target = next((l for l in lines if l[1] > 1 and l[2] + diff > 0), None)
+            if target is None:
+                return single_item()
+            idx = lines.index(target)
+            lines.insert(idx + 1, [target[0], one, target[2] + diff])
+            target[1] -= 1
     items = []
-    for (name, qty, price), value in zip(receipt_lines, sums):
-        if value <= 0:
-            # Не удалось корректно распределить — отдаём заказ одной позицией.
-            return [{
-                "description": f"Заказ — {YOOKASSA_NAME}",
-                "quantity": "1.00",
-                "amount": {"value": _money(final_total), "currency": "RUB"},
-                "payment_mode": "full_prepayment",
-                "payment_subject": "commodity",
-                "vat_code": 1,
-            }]
+    for name, qty, unit in lines:
+        if unit <= 0 or qty <= 0:
+            return single_item()
         items.append({
             "description": str(name)[:128],
             "quantity": f"{qty:.2f}",
-            "amount": {"value": _money(value), "currency": "RUB"},
+            "amount": {"value": _money(unit), "currency": "RUB"},
             "payment_mode": "full_prepayment",
             "payment_subject": "commodity",
             "vat_code": 1,  # без НДС
@@ -1803,8 +1824,15 @@ async def handle_message(message):
         await api.send(chat_id, "✅ Личный чат кассира зарегистрирован. Этот чат будет использоваться для новых заказов.")
         return
 
-    if text.startswith("/courier") and await courier_is(user_id):
-        await api.send(chat_id, "🛵 Панель курьера:", attachments=[courier_panel_keyboard()])
+    if text.startswith("/courier"):
+        st_clear(user_id)
+        if await courier_is(user_id):
+            await api.send(chat_id, "🛵 Вход выполнен. Панель курьера:",
+                           attachments=[courier_panel_keyboard()])
+        else:
+            await api.send(chat_id,
+                           "Нет доступа: вы не добавлены как курьер.\n"
+                           f"Ваш ID: `{user_id}` — передайте его администратору.")
         return
 
     if text.startswith("/offer"):
@@ -2288,7 +2316,7 @@ async def handle_message(message):
         address = user["address"] if user and user["address"] else "—"
         await save_user(user_id, text, phone, address)
         st_set(user_id, "waiting_phone", **data)
-        await api.send(chat_id, "Укажите номер телефона:")
+        await api.send(chat_id, PHONE_PROMPT)
         return
 
     if sname == "waiting_phone":
@@ -2302,7 +2330,7 @@ async def handle_message(message):
         address = user["address"] if user and user["address"] else "—"
         await save_user(user_id, data.get("name", "Гость"), normalized_phone, address)
         st_set(user_id, "waiting_address", **data)
-        await api.send(chat_id, "Укажите адрес доставки:")
+        await api.send(chat_id, f"✅ Телефон: {normalized_phone}\nУкажите адрес доставки:")
         return
 
     if sname == "waiting_address":
@@ -2620,7 +2648,8 @@ async def handle_callback(update):
         return
 
     user = await get_user(user_id)
-    if not user or not user["agreed_offer"]:
+    courier_access = payload.startswith("courier:") and await courier_is(user_id)
+    if (not user or not user["agreed_offer"]) and not courier_access:
         await ack("Сначала согласитесь с офертой: /start")
         return
 
@@ -2817,7 +2846,7 @@ async def handle_callback(update):
         if not user["phone"] or user["phone"] == "—":
             st_set(user_id, "waiting_phone", **data)
             await ack()
-            await api.send(chat_id, "Укажите номер телефона:")
+            await api.send(chat_id, PHONE_PROMPT)
             return
         data["phone"] = user["phone"]
         if not user["address"] or user["address"] == "—":
@@ -2857,7 +2886,7 @@ async def handle_callback(update):
     if payload == "edit_phone":
         st_set(user_id, "edit_phone")
         await ack()
-        await api.send(chat_id, "Введите новый номер телефона:")
+        await api.send(chat_id, PHONE_PROMPT)
         return
 
     if payload == "edit_address":
