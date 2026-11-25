@@ -48,6 +48,14 @@ OFFER_PDF_URL = "https://disk.yandex.ru/i/YWhP_Tsg3c2Mxw"
 DISCOUNT_EVERY_N_ORDERS = 5
 DISCOUNT_PERCENT = Decimal("50")
 MIN_ORDER_AMOUNT = Decimal("900")
+
+def is_admin_user(user_id):
+    """True, если заказ оформляет администратор (для него минималка не действует)."""
+    try:
+        return int(user_id) in ADMIN_IDS
+    except (TypeError, ValueError):
+        return False
+
 FREE_DELIVERY_FROM = Decimal("1000")
 DELIVERY_COST = Decimal("200")
 
@@ -55,8 +63,8 @@ DB_PATH = os.getenv("DB_PATH", "data/shop.db")
 
 # ================= ЮKASSA: НАСТРОЙКИ =================
 # Задаются переменными окружения на bothost.ru:
-#   YOOKASSA_SHOP_ID    — идентификатор магазина (shopId) из личного кабинета ЮKassa
-#   YOOKASSA_SECRET_KEY — секретный ключ из кабинета ЮKassa (Настройки → Ключи API)
+#   YOOKASSA_SHOP_ID    — 1535004
+#   YOOKASSA_SECRET_KEY — <укажи в переменных окружения хостинга>
 # Пока переменные не заданы, бот работает в прежнем режиме (QR-код / кассир).
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
@@ -1403,7 +1411,7 @@ async def cart_text_and_keyboard(user_id):
 
     text = "🛒 Ваша корзина:\n" + "\n".join(lines) + f"\n\nИтого: {total} ₽"
 
-    if total < MIN_ORDER_AMOUNT:
+    if total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
         missing = MIN_ORDER_AMOUNT - total
         text += f"\n⚠️ Минимальный заказ: {MIN_ORDER_AMOUNT} ₽. Добавьте ещё на {missing} ₽"
     elif total < FREE_DELIVERY_FROM:
@@ -2862,7 +2870,7 @@ async def handle_callback(update):
             item = await menu_get(item_key)
             if item and item["active"] and (item["stock"] is None or item["stock"] > 0):
                 total += Decimal(item["price"]) * qty
-        if total < MIN_ORDER_AMOUNT:
+        if total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
             missing = MIN_ORDER_AMOUNT - total
             await api.send(chat_id,
                            f"Минимальный заказ {MIN_ORDER_AMOUNT} ₽. "
