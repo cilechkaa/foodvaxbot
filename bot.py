@@ -1031,6 +1031,20 @@ async def clear_garnishes(user_id):
         await db.execute("DELETE FROM cart_garnish WHERE user_id = ?", (user_id,))
         await db.commit()
 
+async def cart_garnish_for_item(user_id, item_key):
+    """Возвращает гарнир, уже выбранный для блюда (гарнир выбирается один раз)."""
+    pattern = (item_key.replace("\\", "\\\\")
+               .replace("%", "\\%").replace("_", "\\_")) + "#%"
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT item_key FROM carts WHERE user_id = ? AND item_key LIKE ? ESCAPE '\\' "
+            "LIMIT 1", (user_id, pattern)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    _, garnish = parse_cart_key(row[0])
+    return garnish or None
+
 # ================= ИЗБРАННОЕ =================
 async def favorites_add(user_id, item_key):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -2748,10 +2762,8 @@ async def handle_callback(update):
             await ack("Сейчас нет в наличии")
             return
         if await category_requires_garnish(item["category_key"]):
+            # Каждое добавление — новая процедура выбора гарнира.
             await ack()
-            # Один запрос гарнира = один выбор: повторные нажатия кнопок
-            # на этой же карточке игнорируются (см. обработчик garnish:).
-            st_set(user_id, "await_garnish", item_key=key, consumed=False)
             await api.send(chat_id,
                            f"Выберите гарнир к «{item['name']}»:",
                            attachments=[garnish_keyboard(key)])
@@ -2767,17 +2779,6 @@ async def handle_callback(update):
             await ack("Ошибка")
             return
         _, key, garnish = parts
-        # Гарнир выбирается один раз на один запрос: если по этой карточке
-        # выбор уже сделан — повторные нажатия (в том числе на другой гарнир)
-        # не добавляют блюдо второй раз.
-        _st = st_get(user_id)
-        _st_data = _st.get("data") or {}
-        if (_st.get("state") != "await_garnish"
-                or _st_data.get("item_key") != key
-                or _st_data.get("consumed")):
-            await ack("Гарнир для этого блюда уже выбран. Чтобы добавить то же "
-                      "блюдо с другим гарниром — нажмите «Добавить в корзину» ещё раз.")
-            return
         item = await menu_get(key)
         if not item:
             await ack("Блюдо недоступно")
@@ -2785,16 +2786,23 @@ async def handle_callback(update):
         await cancel_pending_user_payments(user_id, chat_id)
         await cart_add(user_id, key, garnish)
         await set_garnish(user_id, key, garnish)
-        # Закрываем запрос: та же карточка больше не принимает нажатия,
-        # а новое «Добавить в корзину» предложит выбрать гарнир заново.
-        st_set(user_id, "await_garnish", item_key=key, consumed=True)
         await ack("Добавлено в корзину")
-        # Автоматически возвращаем предыдущее меню — категорию выбранного блюда.
-        _items = await menu_all(category_key=item["category_key"],
-                                in_stock_only=True)
-        if _items:
+        # Деактивируем кнопки на карточке выбора гарнира: после выбора
+        # они становятся неактивными, повторно нажать другой гарнир нельзя.
+        # То же блюдо с другим гарниром — только через новое добавление в корзину.
+        prompt_mid = _extract_message_id(msg)
+        if prompt_mid:
+            await api.edit(chat_id, prompt_mid,
+                           f"✅ Гарнир к «{item['name']}» выбран: "
+                           f"{GARNISH_LABELS.get(garnish, garnish)}. "
+                           f"Блюдо добавлено в корзину.",
+                           attachments=[])
+        # Автоматически возвращаем предыдущее меню категории.
+        cat_items = await menu_all(category_key=item["category_key"],
+                                   in_stock_only=True)
+        if cat_items:
             await api.send(chat_id, "МЕНЮ",
-                           attachments=[menu_keyboard(_items,
+                           attachments=[menu_keyboard(cat_items,
                                                       item["category_key"])])
         return
 
