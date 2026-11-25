@@ -73,9 +73,6 @@ YOOKASSA_POLL_INTERVAL = 20      # секунд между проверками 
 YOOKASSA_WATCH_HOURS = 12        # сколько часов бот следит за платежом
 YOOKASSA_NAME = "СВОЯ КУХНЯ 89"
 
-# Последняя ошибка API ЮKassa — показывается в админ-панели для диагностики.
-_yk_last_error = None
-
 def yookassa_configured():
     return bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
 
@@ -308,9 +305,7 @@ async def init_db():
             manager_row = await cur.fetchone()
         if manager_row and str(manager_row[0]).isdigit():
             global MANAGER_CHAT_ID
-            MANAGER_CHAT_ID = int(manager_row[0])
-
-# ================= ПОЛЬЗОВАТЕЛИ И НАСТРОЙКИ =================
+            MANAGER_CHAT_ID = int(manager_row[0]) # ================= ПОЛЬЗОВАТЕЛИ И НАСТРОЙКИ =================
 async def get_user(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -576,14 +571,10 @@ async def yookassa_create_payment(order_id, amount, description, receipt_items, 
             data = await resp.json(content_type=None)
         if resp.status in (200, 201) and data.get("id"):
             return data
-        err = f"HTTP {resp.status}: {data}"
-        globals()["_yk_last_error"] = err
-        log.error("ЮKassa: не удалось создать платёж для заказа #%s: %s",
-                  order_id, err)
+        log.error("ЮKassa: не удалось создать платёж для заказа #%s: %s %s",
+                  order_id, resp.status, data)
         return None
-    except Exception as exc:
-        err = f"сеть/исключение: {exc}"
-        globals()["_yk_last_error"] = err
+    except Exception:
         log.exception("ЮKassa: ошибка создания платежа для заказа #%s", order_id)
         return None
 
@@ -698,8 +689,7 @@ async def _yk_watch(order_id, payment_id):
                 return
         log.info("ЮKassa: наблюдение за платежом %s заказа #%s истекло", payment_id, order_id)
     finally:
-        _yk_watching.discard(order_id)
-
+        _yk_watching.discard(order_id) 
 # ================= КАТЕГОРИИ И МЕНЮ =================
 async def categories_all():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1585,8 +1575,6 @@ async def send_offer_screen(chat_id):
         "по кнопке «Прочитать оферту» и выберите «Согласен».",
         attachments=[offer_keyboard()]
     )
-
-
 # ================= ОБРАБОТКА СООБЩЕНИЙ =================
 async def handle_message(message):
     sender = (message.get("sender") or {})
@@ -2165,6 +2153,7 @@ async def handle_message(message):
     else:
         await send_offer_screen(chat_id)
         st_set(user_id, "waiting_offer")
+
 # ================= ЗАКАЗ: ФИНАЛИЗАЦИЯ =================
 async def finalize_order(chat_id, user_id, username):
     data = st_data(user_id)
@@ -2269,26 +2258,12 @@ async def finalize_order(chat_id, user_id, username):
             order_id, final_total,
             f"Заказ №{order_id} — {YOOKASSA_NAME}",
             receipt, phone=data.get("phone"))
-        if not payment:
-            # Одна повторная попытка через 2 секунды — сбой мог быть временным.
-            await asyncio.sleep(2)
-            payment = await yookassa_create_payment(
-                order_id, final_total,
-                f"Заказ №{order_id} — {YOOKASSA_NAME}",
-                receipt, phone=data.get("phone"))
         if payment:
             await order_set_payment_id(order_id, payment["id"])
             log.info("ЮKassa: платёж %s создан для заказа #%s", payment["id"], order_id)
         else:
-            # QR-фолбэк при настроенной ЮKassa не выдаём: клиенту — понятное
-            # сообщение, кассиру — точная причина сбоя для диагностики.
-            log.error("ЮKassa: платёж для заказа #%s не создан после повторной "
-                      "попытки — заказ принимается вручную", order_id)
-            await api.notify_staff(
-                f"⚠️ Заказ №{order_id} на {final_total} ₽ принят, но платёж "
-                f"ЮKassa создать не удалось. Последняя ошибка: "
-                f"{_yk_last_error or 'неизвестна'}. "
-                "Свяжитесь с клиентом для оплаты вручную.")
+            log.error("ЮKassa: платёж для заказа #%s не создан — заказ идёт "
+                      "по старому сценарию (QR/кассир)", order_id)
 
     user_text = (
         "✅ Ваш заказ успешно оформлен!\n\n"
@@ -2304,21 +2279,25 @@ async def finalize_order(chat_id, user_id, username):
         f"💰 **Итого: {final_total} ₽**\n\n"
         f"{bonus_text}\n\n"
     )
+
+    # === ГЛАВНОЕ ИЗМЕНЕНИЕ: сразу показываем ссылку на оплату ЮKassa ===
     if payment:
-        user_text += ("📌 **Для оплаты:**\n"
-                      "Нажмите кнопку **«Оплатить онлайн»** ниже — карта или СБП.")
-    elif yookassa_configured():
-        user_text += ("⚠️ Онлайн-оплата временно недоступна — заказ на "
-                      f"**{final_total} ₽** принят, кассир свяжется с вами "
-                      "для оплаты.")
+        pay_url = payment["confirmation"]["confirmation_url"]
+        user_text += (
+            "📌 **Для оплаты заказа перейдите по ссылке:**\n"
+            f"{pay_url}\n\n"
+            "После оплаты бот автоматически подтвердит платёж и передаст заказ на кухню."
+        )
+    elif await get_setting("payment_qr"):
+        user_text += "📌 **Для оплаты:**\nОтсканируйте QR-код в следующем сообщении."
     else:
         user_text += ("⚠️ Оплата онлайн не настроена — напишите кассиру, "
                       "он пришлёт реквизиты.")
 
     buttons = []
     if payment:
-        buttons.append([link_btn("💳 Оплатить онлайн",
-                                 payment["confirmation"]["confirmation_url"])])
+        # Дублируем ссылку кнопкой для удобства (и на случай, если MAX не сделает её кликабельной в тексте).
+        buttons.append([link_btn("💳 Оплатить онлайн", payment["confirmation"]["confirmation_url"])])
     buttons.append([link_btn("💬 Написать кассиру", MANAGER_USERNAME)])
     buttons.append([cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")])
     customer_result = await api.send(chat_id, user_text, attachments=[kb(buttons)])
@@ -2328,6 +2307,7 @@ async def finalize_order(chat_id, user_id, username):
         log.info("Подтверждение заказа #%s доставлено user_id=%s chat_id=%s", order_id, user_id, chat_id)
 
     if payment:
+        # Дополнительное сообщение с кнопкой проверки оплаты — оставляем как было.
         pay_msg = await api.send(
             chat_id,
             "💳 **Оплата заказа**\n"
@@ -2339,8 +2319,7 @@ async def finalize_order(chat_id, user_id, username):
         if pay_msg is None:
             log.error("Не удалось отправить платёжное сообщение для заказа #%s", order_id)
         asyncio.create_task(_yk_watch(order_id, payment["id"]))
-    elif not yookassa_configured():
-        # QR выдаём только если ЮKassa не настроена вовсе.
+    else:
         qr_token = await get_setting("payment_qr")
         if qr_token:
             qr_sent = await api.send(
@@ -2366,8 +2345,7 @@ async def finalize_order(chat_id, user_id, username):
 
     await cart_clear(user_id)
     await clear_garnishes(user_id)
-    st_clear(user_id)
-
+    st_clear(user_id) 
 # ================= ОБРАБОТКА CALLBACK =================
 async def handle_callback(update):
     cb = update.get("callback") or {}
@@ -2500,110 +2478,36 @@ async def handle_callback(update):
         key = payload.split(":")[1]
         item = await menu_get(key)
         if not item or not item["active"]:
-            await ack("Недоступно")
+            await ack("Блюдо недоступно")
             return
         if item["stock"] is not None and item["stock"] <= 0:
-            await ack("Нет в наличии")
+            await ack("Сейчас нет в наличии")
             return
         if await category_requires_garnish(item["category_key"]):
             await ack()
-            await api.send(chat_id, f"{item['name']} — выберите гарнир:",
+            await api.send(chat_id,
+                           f"Выберите гарнир к «{item['name']}»:",
                            attachments=[garnish_keyboard(key)])
-        else:
-            await cart_add(user_id, key)
-            await ack(f"✅ {item['name']} добавлен в корзину!")
-            # После добавления блюда без гарнира остаёмся в его категории.
-            items = await menu_all(category_key=item["category_key"],
-                                   in_stock_only=True)
-            if items:
-                await api.send(
-                    chat_id, "МЕНЮ",
-                    attachments=[menu_keyboard(items, item["category_key"])]
-                )
-            else:
-                await send_menu(chat_id)
+            return
+        await cart_add(user_id, key)
+        await ack("Добавлено в корзину")
         return
 
     if payload.startswith("garnish:"):
-        try:
-            _, item_key, garnish = payload.split(":", 2)
-        except ValueError:
-            await ack("Некорректный выбор гарнира")
+        parts = payload.split(":")
+        if len(parts) != 3:
+            await ack("Ошибка")
             return
-        if garnish not in GARNISH_LABELS:
-            await ack("Неизвестный гарнир")
+        _, key, garnish = parts
+        item = await menu_get(key)
+        if not item:
+            await ack("Блюдо недоступно")
             return
-        item = await menu_get(item_key)
-        if not item or not item["active"]:
-            await ack("Блюдо больше недоступно")
-            return
-        message_id = (msg.get("message_id") or msg.get("id")
-                      or (msg.get("body") or {}).get("mid") or callback_id)
-        if not message_id:
-            await ack("Не удалось подтвердить выбор. Откройте блюдо и попробуйте ещё раз.")
-            return
-        first_choice = await register_garnish_choice(
-            user_id, message_id, item_key, garnish)
-        if not first_choice:
-            await ack("Для этого блюда гарнир уже выбран")
-            return
-        await set_garnish(user_id, item_key, garnish)
-        await cart_add(user_id, item_key, garnish)
-        await ack("Гарнир выбран")
-        message_text = (f"✅ К блюду «{item['name']}» добавлен гарнир: "
-                        f"{GARNISH_LABELS[garnish]}.")
-        original_message_id = (msg.get("message_id") or msg.get("id")
-                               or (msg.get("body") or {}).get("mid"))
-        edited = False
-        if original_message_id:
-            edited = await api.edit(chat_id, original_message_id, message_text,
-                                    attachments=[])
-        if not edited:
-            await api.send(chat_id, message_text)
-        items = await menu_all(category_key=item["category_key"], in_stock_only=True)
-        if items:
-            await api.send(chat_id, "МЕНЮ",
-                           attachments=[menu_keyboard(items, item["category_key"])])
-        else:
-            await send_menu(chat_id)
+        await cart_add(user_id, key, garnish)
+        await set_garnish(user_id, key, garnish)
+        await ack("Добавлено в корзину")
         return
 
-    if payload == "cart":
-        await ack()
-        text, kbd_ = await cart_text_and_keyboard(user_id)
-        await api.send(chat_id, text, attachments=[kbd_])
-        return
-
-    if payload == "cart_clear":
-        await cart_clear(user_id)
-        await clear_garnishes(user_id)
-        st_clear(user_id)
-        await ack("Корзина очищена")
-        await send_menu(chat_id)
-        return
-
-    if payload.startswith("cartsub:"):
-        await cart_remove_one(user_id, payload.split(":", 1)[1])
-        await ack()
-        text, kbd_ = await cart_text_and_keyboard(user_id)
-        await api.send(chat_id, text, attachments=[kbd_])
-        return
-
-    if payload.startswith("cartadd:"):
-        await cart_add(user_id, payload.split(":", 1)[1])
-        await ack()
-        text, kbd_ = await cart_text_and_keyboard(user_id)
-        await api.send(chat_id, text, attachments=[kbd_])
-        return
-
-    if payload.startswith("cartdel:"):
-        await cart_delete_item(user_id, payload.split(":", 1)[1])
-        await ack()
-        text, kbd_ = await cart_text_and_keyboard(user_id)
-        await api.send(chat_id, text, attachments=[kbd_])
-        return
-
-    # ===== Избранное =====
     if payload.startswith("fav:"):
         key = payload.split(":")[1]
         if await is_favorite(user_id, key):
@@ -2611,324 +2515,108 @@ async def handle_callback(update):
             await ack("Убрано из избранного")
         else:
             await favorites_add(user_id, key)
-            await ack("Добавлено в избранное ❤️")
-        item = await menu_get(key)
-        if item:
-            await api.send(chat_id,
-                           f"**{item['name']}**",
-                           attachments=[await item_card_keyboard(user_id, key,
-                                                                 item["category_key"])])
+            await ack("Добавлено в избранное")
         return
 
     if payload == "favs":
         fav_keys = await favorites_all(user_id)
-        if not fav_keys:
-            await ack()
-            await api.send(chat_id,
-                           "❤️ Избранное пусто.\n\nНажмите «🤍 В избранное» "
-                           "на карточке любого блюда — и оно появится здесь.")
-            return
         buttons = []
         for key in fav_keys:
             item = await menu_get(key)
-            if not item or not item["active"]:
-                continue
-            buttons.append([cb_btn(item_label(item), f"view:{key}")])
-        if not buttons:
-            await ack()
-            await api.send(chat_id, "❤️ Избранное пусто.")
-            return
-        buttons.append([cb_btn("⬅️ Назад", "back_categories")])
+            if item and item["active"]:
+                buttons.append([cb_btn(item_label(item), f"view:{key}")])
+        buttons.append([cb_btn("🏠 Главное меню", "main_menu")])
         await ack()
-        await api.send(chat_id, "❤️ Избранное:", attachments=[kb(buttons)])
-        return
-
-    # ===== Личный кабинет и адресная книга =====
-    if payload == "profile":
-        st_clear(user_id)
-        await ack()
-        await send_profile(chat_id, user_id)
-        return
-    if payload == "addresses":
-        await ack()
-        await send_addresses(chat_id, user_id)
-        return
-    if payload == "address_add":
-        st_set(user_id, "profile_address_add")
-        await ack()
-        await api.send(chat_id, "Введите новый адрес доставки:")
-        return
-    if payload.startswith("address_edit:"):
-        try: address_id=int(payload.split(":",1)[1])
-        except ValueError:
-            await ack("Некорректный адрес"); return
-        if address_id not in {int(a["id"]) for a in await addresses_get(user_id)}:
-            await ack("Адрес не найден"); return
-        st_set(user_id, "profile_address_edit", address_id=address_id)
-        await ack()
-        await api.send(chat_id, "Введите новый адрес:")
-        return
-    if payload.startswith("address_delete:"):
-        try: address_id=int(payload.split(":",1)[1])
-        except ValueError:
-            await ack("Некорректный адрес"); return
-        await address_delete(user_id, address_id)
-        await ack("Адрес удалён")
-        await send_addresses(chat_id, user_id)
-        return
-    if payload.startswith("address_default:"):
-        try: address_id=int(payload.split(":",1)[1])
-        except ValueError:
-            await ack("Некорректный адрес"); return
-        await address_set_default(user_id, address_id)
-        await ack("Основной адрес выбран")
-        await send_addresses(chat_id, user_id)
-        return
-
-    # ===== Оценка блюд после доставки: выбор блюда -> выбор звёзд =====
-    if payload.startswith("ratelist:"):
-        try:
-            rated_order_id = int(payload.split(":", 1)[1])
-        except (ValueError, TypeError):
-            await ack("Некорректный номер заказа")
-            return
-        order = await order_get(rated_order_id)
-        if not order or int(order["user_id"]) != user_id or order["status"] != "done":
-            await ack("Оценивать можно только свой доставленный заказ")
-            return
-        rated_items = await order_rating_items(rated_order_id)
-        if not rated_items:
-            await ack("В заказе нет блюд для оценки")
-            return
-        buttons = []
-        for rated_item in rated_items:
-            item_key = rated_item["item_key"]
-            item_name = rated_item["name"] or item_key
-            current_rating = await dish_user_rating(user_id, rated_order_id, item_key)
-            label = f"⭐ {item_name[:30]}"
-            if current_rating:
-                label += f" — {current_rating}/5"
-            buttons.append([cb_btn(label, f"rateitem:{rated_order_id}:{item_key}")])
-        buttons.append([cb_btn("🛍 Заказать снова", "main_menu")])
-        await ack()
-        await api.send(chat_id,
-                       f"🍽 **Оценка заказа #{rated_order_id}**\n"
-                       "Выберите блюдо, которое хотите оценить:",
+        await api.send(chat_id, "❤️ Избранное:" if fav_keys else "Избранное пусто.",
                        attachments=[kb(buttons)])
         return
 
-    if payload.startswith("rateitem:"):
-        try:
-            _, raw_order_id, item_key = payload.split(":", 2)
-            rated_order_id = int(raw_order_id)
-        except (ValueError, TypeError):
-            await ack("Некорректный выбор блюда")
-            return
-        order = await order_get(rated_order_id)
-        if not order or int(order["user_id"]) != user_id or order["status"] != "done":
-            await ack("Оценивать можно только свой доставленный заказ")
-            return
-        rated_items = await order_rating_items(rated_order_id)
-        selected = next((r for r in rated_items if r["item_key"] == item_key), None)
-        if not selected:
-            await ack("Это блюдо не найдено в вашем заказе")
-            return
-        item_name = selected["name"] or item_key
-        current_rating = await dish_user_rating(user_id, rated_order_id, item_key)
-        buttons = [[cb_btn(
-            (("⭐ " if stars <= (current_rating or 0) else "") + f"{stars} ⭐"),
-            f"rate:{rated_order_id}:{item_key}:{stars}")
-            for stars in range(1, 6)]]
-        buttons.append([cb_btn("⬅️ К списку блюд", f"ratelist:{rated_order_id}")])
+    if payload == "search_hint":
         await ack()
-        await api.send(chat_id,
-                       f"🍽 **{item_name}**\n"
-                       + (f"Ваша текущая оценка: {current_rating}/5. Её можно изменить.\n"
-                          if current_rating else "Поставьте оценку от 1 до 5 звёзд:\n")
-                       + "Выберите количество звёзд:",
-                       attachments=[kb(buttons)])
+        await api.send(chat_id, "🔍 Напишите название блюда для поиска:")
         return
 
-    if payload.startswith("rate:"):
-        try:
-            _, raw_order_id, item_key, raw_rating = payload.split(":", 3)
-            rated_order_id = int(raw_order_id)
-            rating = int(raw_rating)
-        except (ValueError, TypeError):
-            await ack("Некорректная оценка")
-            return
-        if rating < 1 or rating > 5:
-            await ack("Оценка должна быть от 1 до 5")
-            return
-        saved = await save_dish_rating(user_id, rated_order_id, item_key, rating)
-        if not saved:
-            await ack("Оценить можно только блюдо из вашего доставленного заказа")
-            return
-        avg_rating, rating_count = await dish_rating_summary(item_key)
-        item = await menu_get(item_key)
-        dish_name = item["name"] if item else item_key
-        await ack(f"Спасибо! {rating} из 5 ⭐")
-        # Обновляем сообщение со звёздами сразу после нажатия, чтобы пользователь
-        # увидел сохранённую оценку без дополнительного сообщения.
-        message_id = (msg.get("message_id") or msg.get("id")
-                      or (msg.get("body") or {}).get("mid"))
-        selected_stars = "⭐" * rating + "☆" * (5 - rating)
-        updated_text = (
-            f"✅ **Оценка сохранена!**\n"
-            f"{dish_name}: {selected_stars} ({rating}/5)\n"
-            f"Средняя оценка блюда: {avg_rating:.1f}/5 "
-            f"({rating_count} оценок).\n\n"
-            "Спасибо за обратную связь! Вы можете изменить оценку или выбрать другое блюдо."
-        )
-        buttons = [[cb_btn(
-            (("⭐" if stars <= rating else "☆") + f" {stars}"),
-            f"rate:{rated_order_id}:{item_key}:{stars}")
-            for stars in range(1, 6)]]
-        buttons.append([cb_btn("⬅️ Оценить другое блюдо", f"ratelist:{rated_order_id}")])
-        edited = False
-        if message_id:
-            edited = await api.edit(chat_id, message_id, updated_text,
-                                    attachments=[kb(buttons)])
-        if not edited:
-            await api.send(chat_id, updated_text,
-                           attachments=[kb(buttons)])
-        return
-
-    # ===== История и повтор заказа =====
-    if payload == "history":
-        orders = await orders_of_user(user_id, limit=10)
-        if not orders:
-            await ack()
-            await api.send(chat_id,
-                           "📜 История заказов пуста. Оформите первый заказ!")
-            return
+    if payload == "cart":
+        text, cart_kb = await cart_text_and_keyboard(user_id)
         await ack()
-        for o in orders:
-            text = (f"📜 {STATUS_LABELS.get(o['status'], o['status'])}\n"
-                    f"Создан: {o['created_at']}\n"
-                    f"{o['items']}\n\n💰 Итого: {o['total']} ₽")
-            if o["delivery_time"] and o["delivery_time"] != "—":
-                text += f"\n⏰ К времени: {o['delivery_time']}"
-            history_buttons = [[cb_btn("🔁 Повторить заказ", f"reorder:{o['id']}")]]
-            if o["status"] in ("new", "paid"):
-                history_buttons.append([cb_btn("❌ Отменить заказ", f"cancelorder:{o['id']}")])
-            await api.send(chat_id, text, attachments=[kb(history_buttons)])
+        await api.send(chat_id, text, attachments=[cart_kb])
         return
 
-    if payload.startswith("reorder:"):
-        order_id = int(payload.split(":")[1])
-        items = await orders_items_of_user(user_id, order_id)
-        if not items:
-            await ack("Не удалось найти состав заказа")
-            return
-        st_clear(user_id)
+    if payload.startswith("cartadd:"):
+        key = payload.split(":", 1)[1]
+        await cart_add(user_id, key)
+        await ack("Добавлено")
+        text, cart_kb = await cart_text_and_keyboard(user_id)
+        await api.send(chat_id, text, attachments=[cart_kb])
+        return
+
+    if payload.startswith("cartsub:"):
+        key = payload.split(":", 1)[1]
+        await cart_remove_one(user_id, key)
+        await ack()
+        text, cart_kb = await cart_text_and_keyboard(user_id)
+        await api.send(chat_id, text, attachments=[cart_kb])
+        return
+
+    if payload.startswith("cartdel:"):
+        key = payload.split(":", 1)[1]
+        await cart_delete_item(user_id, key)
+        await ack("Удалено")
+        text, cart_kb = await cart_text_and_keyboard(user_id)
+        await api.send(chat_id, text, attachments=[cart_kb])
+        return
+
+    if payload == "cart_clear":
         await cart_clear(user_id)
         await clear_garnishes(user_id)
-        added = 0
-        for row in items:
-            item = await menu_get(row["item_key"])
-            if not item or not item["active"]:
-                continue
-            if item["stock"] is not None and item["stock"] <= 0:
-                continue
-            garnish = row["garnish"] or None
-            for _ in range(row["quantity"]):
-                await cart_add(user_id, row["item_key"], garnish)
-            if garnish:
-                await set_garnish(user_id, row["item_key"], garnish)
-            added += 1
-        if added == 0:
-            await ack("Ни одна позиция недоступна — меню изменилось")
-            return
-        text, kbd_ = await cart_text_and_keyboard(user_id)
-        await ack()
-        await api.send(chat_id,
-                       f"🔁 Предыдущий заказ добавлен в корзину ({added} поз.):\n\n{text}",
-                       attachments=[kbd_])
+        await ack("Корзина очищена")
+        text, cart_kb = await cart_text_and_keyboard(user_id)
+        await api.send(chat_id, text, attachments=[cart_kb])
         return
 
-    # ===== Быстрая правка телефона и адреса =====
-    if payload == "edit_phone":
-        u = await get_user(user_id)
-        current = u["phone"] if u and u["phone"] else "не указан"
-        st_set(user_id, "edit_phone")
-        await ack()
-        await api.send(chat_id, f"Текущий телефон: {current}\n\nВведите новый номер:")
-        return
-
-    if payload == "edit_address":
-        u = await get_user(user_id)
-        current = u["address"] if u and u["address"] else "не указан"
-        st_set(user_id, "edit_address")
-        await ack()
-        await api.send(chat_id, f"Текущий адрес: {current}\n\nВведите новый адрес:")
-        return
-
-    # ===== Оформление заказа =====
     if payload == "order":
-        # Сначала подтверждаем нажатие MAX, не дожидаясь медленных запросов к БД.
-        # Иначе клиент повторно нажимает кнопку, а MAX присылает callback ещё раз.
-        await ack()
-
-        # Не запускаем оформление повторно, если пользователь уже находится
-        # внутри этого же процесса оформления.
-        current_state = st_get(user_id).get("state")
-        checkout_states = {
-            "waiting_name", "waiting_phone", "waiting_address",
-            "confirm_data", "waiting_time", "waiting_comment",
-            "admin_manager_id", "edit_phone", "edit_address"
-        }
-        if current_state in checkout_states:
-            await api.send(chat_id,
-                           "Оформление уже начато. Продолжите отвечать на вопросы выше.")
-            return
-
         rows = await cart_get(user_id)
         if not rows:
-            await api.send(chat_id, "Корзина пуста. Добавьте блюда перед оформлением.")
+            await ack("Корзина пуста")
             return
-
+        # Считаем сумму, чтобы проверить минимальный заказ
         total = Decimal("0")
         for key, qty in rows:
             item_key, _ = parse_cart_key(key)
             item = await menu_get(item_key)
-            if item and item["active"] and (item["stock"] is None or item["stock"] > 0):
+            if item:
                 total += Decimal(item["price"]) * qty
         if total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
-            missing = MIN_ORDER_AMOUNT - total
-            await api.send(chat_id,
-                           f"Минимальный заказ {MIN_ORDER_AMOUNT} ₽. "
-                           f"Добавьте ещё на {missing} ₽.")
+            await ack(f"Минимальный заказ {MIN_ORDER_AMOUNT} ₽")
             return
-
-        if user["name"] and user["phone"] and user["address"]:
-            text = ("Ваши данные для доставки:\n\n"
-                    f"👤 Имя: {user['name']}\n"
-                    f"📞 Тел: {user['phone']}\n"
-                    f"📍 Адрес: {user['address']}\n\n"
-                    "Все верно?")
-            st_set(user_id, "confirm_data")
-            await api.send(chat_id, text,
-                           attachments=[kb([
-                               [cb_btn("✅ Да, оформить", "confirm_yes")],
-                               [cb_btn("✏️ Изменить данные", "confirm_no")],
-                           ])])
-        else:
+        user = await get_user(user_id)
+        data = {}
+        if not user or not user["name"]:
             st_set(user_id, "waiting_name")
-            await api.send(chat_id, "Как вас зовут?")
-        return
-
-    if payload == "confirm_yes":
-        data = st_data(user_id)
-        data["name"], data["phone"], data["address"] = (
-            user["name"], user["phone"], user["address"])
+            await ack()
+            await api.send(chat_id, "Укажите ваше имя:")
+            return
+        data["name"] = user["name"]
+        if not user["phone"] or user["phone"] == "—":
+            st_set(user_id, "waiting_phone", **data)
+            await ack()
+            await api.send(chat_id, "Укажите номер телефона:")
+            return
+        data["phone"] = user["phone"]
+        if not user["address"] or user["address"] == "—":
+            st_set(user_id, "waiting_address", **data)
+            await ack()
+            await api.send(chat_id, "Укажите адрес доставки:")
+            return
+        data["address"] = user["address"]
         st_set(user_id, "waiting_time", **data)
         await ack()
+        buttons = [[cb_btn("🚀 Как можно скорее", "time:now")]]
         await api.send(chat_id,
                        "⏰ Когда доставить заказ?\n\n"
                        "• Нажмите «Как можно скорее»\n"
                        "• Или напишите время, например: «к 19:00»",
-                       attachments=[kb([[cb_btn("🚀 Как можно скорее", "time:now")]])])
+                       attachments=[kb(buttons)])
         return
 
     if payload == "time:now":
@@ -2936,16 +2624,9 @@ async def handle_callback(update):
         data["delivery_time"] = "Как можно скорее"
         st_set(user_id, "waiting_comment", **data)
         await ack()
-        await api.send(chat_id,
-                       "Комментарий к заказу (или «Пропустить и оплатить»):",
-                       attachments=[kb([[cb_btn("Пропустить и оплатить",
-                                                "skip_comment")]])])
-        return
-
-    if payload == "confirm_no":
-        st_set(user_id, "waiting_name")
-        await ack()
-        await api.send(chat_id, "Введите ваше имя:")
+        buttons = [[cb_btn("Пропустить и оплатить", "skip_comment")]]
+        await api.send(chat_id, "Комментарий к заказу (или «Пропустить и оплатить»):",
+                       attachments=[kb(buttons)])
         return
 
     if payload == "skip_comment":
@@ -2956,744 +2637,488 @@ async def handle_callback(update):
         await finalize_order(chat_id, user_id, callback_username)
         return
 
-    if payload == "contact_manager":
-        await ack("Открываю контакт кассира")
-        await api.send(chat_id, "Свяжитесь с кассиром:",
-                       attachments=[kb([[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
+    if payload == "edit_phone":
+        st_set(user_id, "edit_phone")
+        await ack()
+        await api.send(chat_id, "Введите новый номер телефона:")
+        return
+
+    if payload == "edit_address":
+        st_set(user_id, "edit_address")
+        await ack()
+        await api.send(chat_id, "Введите новый адрес доставки:")
+        return
+
+    if payload == "profile":
+        await ack()
+        await send_profile(chat_id, user_id)
+        return
+
+    if payload == "addresses":
+        await ack()
+        await send_addresses(chat_id, user_id)
+        return
+
+    if payload == "address_add":
+        st_set(user_id, "profile_address_add")
+        await ack()
+        await api.send(chat_id, "Введите новый адрес (улица, дом, квартира):")
+        return
+
+    if payload.startswith("address_edit:"):
+        address_id = payload.split(":")[1]
+        st_set(user_id, "profile_address_edit", address_id=address_id)
+        await ack()
+        await api.send(chat_id, "Введите новый текст адреса:")
+        return
+
+    if payload.startswith("address_delete:"):
+        address_id = int(payload.split(":")[1])
+        await address_delete(user_id, address_id)
+        await ack("Адрес удалён")
+        await send_addresses(chat_id, user_id)
+        return
+
+    if payload.startswith("address_default:"):
+        address_id = int(payload.split(":")[1])
+        await address_set_default(user_id, address_id)
+        await ack("Основной адрес обновлён")
+        await send_addresses(chat_id, user_id)
+        return
+
+    if payload == "history":
+        orders = await orders_of_user(user_id, limit=10)
+        if not orders:
+            await ack()
+            await api.send(chat_id, "У вас пока нет заказов.",
+                           attachments=[kb([[cb_btn("🏠 Главное меню", "main_menu")]])])
+            return
+        lines = []
+        for o in orders:
+            status = STATUS_LABELS.get(o["status"], o["status"])
+            lines.append(f"#{o['id']} — {o['total']} ₽ — {status} — {o['created_at']}")
+        await ack()
+        await api.send(chat_id, "📜 **Ваши последние заказы:**\n\n" + "\n".join(lines),
+                       attachments=[kb([[cb_btn("🏠 Главное меню", "main_menu")]])])
         return
 
     if payload.startswith("cancelorder:"):
-        try:
-            order_id = int(payload.split(":", 1)[1])
-        except (ValueError, IndexError):
-            await ack("Некорректный заказ")
-            return
-        order = await order_get(order_id)
-        if not order or order["user_id"] != user_id:
-            await ack("Заказ не найден")
-            return
-        if order["status"] not in ("new", "paid"):
-            await ack("Отмена доступна только до начала приготовления")
-            return
-        if not await order_cancel_if_allowed(order_id, user_id):
-            await ack("Заказ уже перешёл в приготовление или был изменён")
-            return
-        await decrement_order_count(user_id)
-        if yookassa_configured() and order["payment_id"]:
-            asyncio.create_task(_yk_cancel_after_cancel_order(
-                order["payment_id"], order_id))
-        await ack("Заказ отменён")
-        await api.send(chat_id, "❌ Ваш заказ отменён. Если потребуется, вы можете оформить новый.",
-                       attachments=[kb([[cb_btn("🏠 Главное меню", "main_menu")]])])
-        await api.notify_staff(
-            f"❌ Клиент отменил заказ #{order_id}.\n"
-            f"Клиент: {order['name']} (ID: {user_id})\n"
-            f"Сумма: {order['total']} ₽")
+        order_id = int(payload.split(":")[1])
+        ok = await order_cancel_if_allowed(order_id, user_id)
+        if ok:
+            await ack("Заказ отменён")
+            order = await order_get(order_id)
+            if order and order["payment_id"]:
+                asyncio.create_task(_yk_cancel_after_cancel_order(order["payment_id"], order_id))
+            await api.send(chat_id, f"❌ Заказ #{order_id} отменён.")
+            await api.notify_staff(f"❌ Клиент отменил заказ #{order_id}.")
+        else:
+            await ack("Отменить уже нельзя")
         return
 
     if payload.startswith("paid:"):
-        try:
-            order_id = int(payload.split(":", 1)[1])
-        except (ValueError, IndexError):
-            await ack("Некорректный номер заказа")
-            return
+        order_id = int(payload.split(":")[1])
         order = await order_get(order_id)
         if not order or order["user_id"] != user_id:
             await ack("Заказ не найден")
             return
-        if order["status"] == "cancelled":
-            await ack("Заказ отменён. Свяжитесь с кассиром.")
-            return
-        if order["status"] in ("paid", "cooking", "delivering", "done"):
-            await ack("Оплата уже отмечена")
-            return
-        if yookassa_configured() and order["payment_id"]:
-            payment = await yookassa_get_payment(order["payment_id"])
-            pay_status = (payment or {}).get("status")
-            if pay_status == "succeeded":
-                await order_set_status(order_id, "paid")
-                await ack("Оплата подтверждена!")
-                await api.send(chat_id,
-                               "💳 Оплата заказа подтверждена!\n"
-                               "Заказ передаётся на кухню. Спасибо!")
-                await api.notify_staff(
-                    f"💳 Заказ #{order_id} оплачен через ЮKassa (проверено по кнопке).\n"
-                    f"Клиент: {order['name']} (@{order['username']}, ID: {order['user_id']})\n"
-                    f"Сумма: {order['total']} ₽\n\n"
-                    "Заказ можно передавать на кухню.",
-                    attachments=[manager_keyboard(order_id, "paid")])
-            elif pay_status == "canceled":
-                await ack("Платёж не завершён")
-                await api.send(chat_id,
-                               "❌ Платёж по заказу не завершён или отменён.\n"
-                               "Оформите заказ заново или напишите кассиру.",
-                               attachments=[kb([[cb_btn("💬 Написать кассиру", "contact_manager")]])])
-            else:
-                await ack("Оплата пока не поступила")
-                await api.send(chat_id,
-                               "⏳ Оплата пока не поступила.\n"
-                               "Если вы только что оплатили — подождите минуту "
-                               "и нажмите «Проверить оплату» ещё раз.")
-            return
-        # Резервный сценарий (без ЮKassa): клиент подтверждает оплату кассиру.
-        await order_set_status(order_id, "paid")
-        await ack("Спасибо! Сообщение об оплате отправлено кассиру.")
-        await api.send(chat_id,
-                       "💳 Вы сообщили об оплате заказа.\n"
-                       "Статус: **Оплата ожидает проверки кассиром**.\n"
-                       "После проверки кассир обновит статус заказа, и бот сообщит вам.")
-        manager_order_text = (
-            f"💳 Клиент сообщил об оплате заказа #{order_id}.\n"
-            f"Клиент: {order['name']} (@{order['username']}, ID: {order['user_id']})\n"
-            f"Сумма: {order['total']} ₽\n\n"
-            "Проверьте поступление оплаты и переведите заказ в приготовление."
-        )
         await api.notify_staff(
-            manager_order_text, attachments=[manager_keyboard(order_id, "paid")])
+            f"💳 Клиент сообщил об оплате заказа #{order_id}.\n"
+            f"Сумма: {order['total']} ₽\n"
+            "Проверьте поступление средств.",
+            attachments=[manager_keyboard(order_id, order["status"])])
+        await ack("Кассир уведомлён")
+        await api.send(chat_id, "✅ Спасибо! Кассир проверит оплату.")
         return
 
-    # ===== Админ-панель =====
-    if payload == "admin_cancel":
-        st_clear(user_id)
-        await ack()
-        await api.send(chat_id, "Отменено.", attachments=[admin_panel_keyboard()])
-        return
-
-    if payload == "admin:yk" and is_admin(user_id):
-        await ack()
-        if yookassa_configured():
-            await api.send(chat_id,
-                           "💳 **ЮKassa подключена.**\n"
-                           f"shopId: `{YOOKASSA_SHOP_ID}`\n"
-                           "Способ оплаты: ссылка «Оплатить онлайн» (карта/СБП).\n"
-                           "Чеки: «Чеки от ЮKassa» (54-ФЗ, АУСН).\n\n"
-                           "Бот сам проверяет оплату и переводит заказ в «Оплачен».")
-        elif _yk_last_error:
-            await api.send(chat_id,
-                           f"⚠️ **ЮKassa подключена, но платежи не создаются.**\n"
-                           f"shopId: `{YOOKASSA_SHOP_ID}`\n"
-                           f"Последняя ошибка API: {_yk_last_error}\n\n"
-                           "Типичные причины: отозван/неверен секретный ключ "
-                           "(HTTP 401) или способ приёма платежей не одобрен "
-                           "(HTTP 403).",
-                           attachments=[admin_panel_keyboard()])
-        else:
-            await api.send(chat_id,
-                           "⚠️ **ЮKassa не настроена.**\n"
-                           "Добавьте переменные окружения на bothost.ru:\n"
-                           "`YOOKASSA_SHOP_ID` и `YOOKASSA_SECRET_KEY` "
-                           "(значения — из кабинета ЮKassa).\n\n"
-                           "Пока их нет, заказы работают по старому сценарию "
-                           "(QR-код/кассир).",
-                           attachments=[admin_panel_keyboard()])
-        return
-
-    if payload == "admin:menu_clear_confirm" and is_admin(user_id):
-        await ack()
-        await api.send(chat_id,
-                       "⚠️ Вы действительно хотите удалить ВСЕ блюда из меню?\n"
-                       "Категории, настройки и история заказов сохранятся.\n"
-                       "Действие нельзя отменить.",
-                       attachments=[kb([
-                           [cb_btn("🗑 Да, удалить всё меню", "admin:menu_clear_yes")],
-                           [cb_btn("↩️ Нет, вернуться", "admin:back")],
-                       ])])
-        return
-
-    if payload == "admin:menu_clear_yes" and is_admin(user_id):
-        await menu_delete_all()
-        await ack("Меню удалено")
-        await api.send(chat_id, "✅ Все блюда удалены. Категории и настройки сохранены.",
-                       attachments=[admin_panel_keyboard()])
-        return
-
-    if payload == "admin:add" and is_admin(user_id):
-        st_set(user_id, "admin_add_key")
-        await ack()
-        await api.send(chat_id, "Ключ блюда (латиницей):")
-        return
-
-    if payload == "admin:list" and is_admin(user_id):
-        items = await menu_all(active_only=False)
-        if not items:
-            await ack("Меню пустое.")
+    if payload.startswith("setstatus:"):
+        if not is_manager(user_id):
+            await ack("Нет доступа")
             return
-        await ack()
-        for item in items:
-            stock = item["stock"]
-            stock_str = "без учёта" if stock is None else str(stock)
-            text = (f"🔑 {item['key']}\n📛 {item['name']}\n"
-                    f"📝 {item['description'] or '—'}\n"
-                    f"💰 {item['price']} ₽\n🗂 {item['category_key']}\n"
-                    f"📦 Остаток: {stock_str}\n"
-                    f"Статус: {'активно' if item['active'] else 'скрыто'}")
-            attachments = [admin_item_keyboard(item["key"], item["active"])]
-            if item["photo_token"]:
-                attachments.insert(0, photo_attachment(item["photo_token"]))
-            await api.send(chat_id, text, attachments=attachments)
-        return
-
-    if payload == "admin:cats" and is_admin(user_id):
-        cats = await categories_all()
-        text = "Категории:\n" + "\n".join(
-            f"• {c['key']} — {c['display_name'] or c['name']}" for c in cats)
-        buttons = [[cb_btn(f"✏️ Изменить: {c['display_name'] or c['name']}",
-                           f"catrename:{c['key']}")]
-                   for c in cats if c["key"] != "default"]
-        buttons.extend([
-            [cb_btn("➕ Добавить категорию", "admin:cat_add")],
-            [cb_btn("🗑 Удалить категорию", "admin:cat_del")],
-            [cb_btn("⬅️ В админ-панель", "admin:back")],
-        ])
-        await ack()
-        await api.send(chat_id, text, attachments=[kb(buttons)])
-        return
-
-    if payload == "admin:manager_id" and is_admin(user_id):
-        await ack()
-        await api.send(chat_id,
-                       "Чтобы узнать ID кассира, попросите его открыть чат с ботом "
-                       "по вашей ссылке и отправить команду /myid.\n\n"
-                       "Затем отправьте сюда полученный числовой ID. После этого "
-                       "новые заказы и сообщения об оплате будут приходить кассиру "
-                       "и администраторам.")
-        st_set(user_id, "admin_manager_id")
-        return
-
-    if payload.startswith("catrename:") and is_admin(user_id):
-        key = payload.split(":", 1)[1]
-        cats = await categories_all()
-        if not any(c["key"] == key for c in cats):
-            await ack("Категория не найдена")
+        parts = payload.split(":")
+        if len(parts) != 3:
+            await ack("Ошибка")
             return
-        if key == "default":
-            await ack("Служебную категорию переименовать нельзя")
-            return
-        st_set(user_id, "admin_cat_rename", key=key)
-        await ack()
-        await api.send(chat_id, f"Введите новое название категории «{key}»:")
-        return
-
-    if payload == "admin:cat_add" and is_admin(user_id):
-        st_set(user_id, "admin_cat_key")
-        await ack()
-        await api.send(chat_id, "Ключ категории (латиницей):")
-        return
-
-    if payload == "admin:cat_del" and is_admin(user_id):
-        cats = await categories_all()
-        deletable = [c for c in cats if c["key"] != "default"]
-        if not deletable:
-            await ack("Удалять нечего: кроме служебной категории «Меню» "
-                      "других категорий нет.")
-            return
-        buttons = [[cb_btn(f"🗑 {c['display_name'] or c['name']} ({c['key']})",
-                           f"catdel:{c['key']}")] for c in deletable]
-        buttons.append([cb_btn("⬅️ Назад", "admin:back")])
-        await ack()
-        await api.send(chat_id,
-                       "Выберите категорию для удаления.\n"
-                       "Блюда из неё автоматически переедут в категорию «Меню».",
-                       attachments=[kb(buttons)])
-        return
-
-    if payload.startswith("catdel:") and is_admin(user_id):
-        key = payload.split(":")[1]
-        if key == "default":
-            await ack("Служебную категорию удалить нельзя")
-            return
-        await category_delete(key)
-        await ack()
-        await api.send(chat_id,
-                       f"🗑 Категория `{key}` удалена. "
-                       f"Её блюда переедут в категорию «Меню».")
-        return
-
-    if payload == "admin:stock" and is_admin(user_id):
-        items = await menu_all(active_only=False)
-        if not items:
-            await ack("Меню пустое.")
-            return
-        lines = ["📦 **Остатки и стоп-лист**\n"]
-        buttons = []
-        for item in items:
-            stock = item["stock"]
-            stock_str = "без учёта" if stock is None else str(stock)
-            status = "🚫 СТОП" if stock == 0 else "✅ в наличии"
-            lines.append(f"• {item['name']} — остаток: {stock_str} ({status})")
-            if stock == 0:
-                buttons.append([cb_btn(f"✅ Вернуть в продажу: {item['name']}",
-                                       f"stock:{item['key']}:on")])
-            else:
-                buttons.append([cb_btn(f"🚫 В стоп-лист: {item['name']}",
-                                       f"stock:{item['key']}:off")])
-        buttons.append([cb_btn("⬅️ Назад", "admin:back")])
-        await ack()
-        await api.send(chat_id, "\n".join(lines), attachments=[kb(buttons)])
-        return
-
-    if payload.startswith("stock:") and is_admin(user_id):
-        _, key, action = payload.split(":")
-        new_stock = 0 if action == "off" else None
-        await menu_update(key, "stock", new_stock)
-        label = "🚫 в стоп-листе" if action == "off" else "✅ вернулся в продажу"
-        await ack("Готово")
-        await api.send(chat_id, f"Блюдо `{key}` {label}.")
-        return
-
-    if payload == "admin:stats" and is_admin(user_id):
-        all_time, today = await stats_summary()
-        lines = ["📈 **Статистика**",
-                 f"Заказов всего: {all_time['cnt']} | Выручка: {all_time['revenue']} ₽",
-                 f"Заказов сегодня: {today['cnt']} | Выручка: {today['revenue']} ₽",
-                 "",
-                 "🏆 **Топ-10 блюд по продажам:**"]
-        top = await sales_top(10)
-        if not top:
-            lines.append("Пока нет продаж (учитываются заказы после этого обновления).")
-        else:
-            for i, row in enumerate(top, start=1):
-                item = await menu_get(row["item_key"])
-                name = item["name"] if item else row["item_key"]
-                lines.append(f"{i}. {name} — {row['total_qty']} шт. "
-                             f"({row['orders_cnt']} заказов)")
-        await ack()
-        await api.send(chat_id, "\n".join(lines))
-        return
-
-    if payload == "admin:bulk_photos" and is_admin(user_id):
-        st_set(user_id, "admin_bulk_photos")
-        await ack()
-        await api.send(
-            chat_id,
-            "📸 Отправьте фотографии блюд как файлы-документы (можно несколько "
-            "за раз).\n\n"
-            "Название файла должно совпадать с названием блюда в меню, "
-            "без тире и цены. Например, для блюда «Котлета по-киевски» "
-            "назовите файл «Котлета по-киевски.jpg».\n"
-            "Поддерживаются JPG, JPEG, PNG, WEBP, GIF и BMP.\n"
-            "Для отмены напишите «отмена».")
-        return
-
-    if payload == "admin:qr" and is_admin(user_id):
-        st_set(user_id, "admin_qr")
-        await ack()
-        await api.send(chat_id,
-                       "Отправьте фото QR-кода для оплаты (оно будет показываться "
-                       "клиентам после оформления заказа):")
-        return
-
-    if payload == "admin:excel" and is_admin(user_id):
-        st_set(user_id, "admin_excel")
-        await ack()
-        await api.send(chat_id,
-                       "Пришлите Excel-файл .xlsx как документ.\n\n"
-                       "Столбцы в первой строке (заголовки):\n"
-                       "key | name | description | price | category_key | category_name\n\n"
-                       "Пример: kotleta | Котлета по-киевски | 250 г, курица | "
-                       "350 | hot_dishes | Горячие блюда\n\n"
-                       "Можно использовать русские заголовки: Ключ, Название, "
-                       "Описание, Цена, Категория, Название категории. "
-                       "Если категории ещё нет, она создастся автоматически.\n"
-                       "Для отмены напишите: отмена")
-        return
-
-    if payload == "admin:backup" and is_admin(user_id):
-        await ack()
-        try:
-            src = sqlite3.connect(DB_PATH)
-            dump = "\n".join(src.iterdump())
-            src.close()
-            chunk_size = 3500
-            parts = [dump[i:i + chunk_size]
-                     for i in range(0, len(dump), chunk_size)]
-            await api.send(chat_id,
-                           f"💾 Резервная копия базы (SQL-дамп), "
-                           f"частей: {len(parts)}. Сохраните их все.")
-            for i, part in enumerate(parts, start=1):
-                await api.send(chat_id, f"— Часть {i}/{len(parts)} —\n```\n{part}\n```")
-        except Exception as e:
-            await api.send(chat_id, f"❌ Не удалось сделать копию: {e}")
-        return
-
-    if payload == "admin:orders_clear_confirm" and is_admin(user_id):
-        # Сначала показываем отдельное подтверждение, чтобы исключить случайное удаление.
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT COUNT(*) FROM orders") as cur:
-                row = await cur.fetchone()
-                orders_count = row[0] if row else 0
-        await ack()
-        await api.send(
-            chat_id,
-            f"⚠️ Вы действительно хотите удалить ВСЕ заказы?\n"
-            f"Будет удалено заказов: {orders_count}.\n"
-            "Также будут удалены связанные позиции заказов.\n"
-            "Меню, клиенты, адреса, настройки и счётчики скидок останутся.\n"
-            "Действие нельзя отменить.",
-            attachments=[kb([
-                [cb_btn("🧹 Да, удалить все заказы", "admin:orders_clear_yes")],
-                [cb_btn("↩️ Нет, вернуться", "admin:back")],
-            ])]
-        )
-        return
-
-    if payload == "admin:orders_clear_yes" and is_admin(user_id):
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("BEGIN IMMEDIATE")
-                async with db.execute("SELECT COUNT(*) FROM orders") as cur:
-                    row = await cur.fetchone()
-                    orders_count = row[0] if row else 0
-                await db.execute("DELETE FROM dish_ratings")
-                await db.execute("DELETE FROM order_items")
-                await db.execute("DELETE FROM orders")
-                # Сбрасываем последовательность номеров, чтобы новые заказы начинались с №1.
-                await db.execute("DELETE FROM sqlite_sequence WHERE name = 'orders'")
-                await db.commit()
-            await ack("Все заказы удалены")
-            await api.send(
-                chat_id,
-                f"✅ Готово. Удалено заказов: {orders_count}.\n"
-                "История заказов очищена. Счётчики скидок клиентов сохранены.",
-                attachments=[admin_panel_keyboard()]
-            )
-        except Exception as e:
-            await ack("Не удалось удалить заказы")
-            await api.send(chat_id, f"❌ Ошибка при сбросе заказов: {e}")
-        return
-
-    if payload == "admin:orders" and is_admin(user_id):
-        active_statuses = ("new", "paid", "cooking", "delivering")
-        counts = {}
-        async with aiosqlite.connect(DB_PATH) as db:
-            for status in active_statuses:
-                async with db.execute(
-                    "SELECT COUNT(*) FROM orders WHERE status = ?", (status,)
-                ) as cur:
-                    row = await cur.fetchone()
-                    counts[status] = row[0] if row else 0
-        labels = {
-            "new": "🆕 Новые / ожидают оплаты",
-            "paid": "💳 Клиент сообщил об оплате",
-            "cooking": "👨‍🍳 Готовятся",
-            "delivering": "🛵 Доставляются",
-        }
-        lines = ["📋 **Активные заказы**", ""]
-        for status in active_statuses:
-            lines.append(f"{labels[status]}: **{counts[status]}**")
-        buttons = [[cb_btn(f"{labels[status]} ({counts[status]})",
-                           f"admin:orders:{status}")]
-                   for status in active_statuses]
-        buttons.append([cb_btn("🔄 Обновить", "admin:orders")])
-        buttons.append([cb_btn("⬅️ В админ-панель", "admin:back")])
-        await ack()
-        await api.send(chat_id, "\n".join(lines), attachments=[kb(buttons)])
-        return
-
-    if payload.startswith("admin:orders:") and is_admin(user_id):
-        status = payload.split(":", 2)[2]
-        if status not in {"new", "paid", "cooking", "delivering"}:
+        _, order_id, new_status = parts
+        order_id = int(order_id)
+        if new_status not in STATUS_LABELS:
             await ack("Неизвестный статус")
             return
-        orders = await orders_by_status(status, limit=30)
-        if not orders:
-            await ack("Заказов в этом статусе нет")
-            await api.send(chat_id, "В этой категории пока нет заказов.",
-                           attachments=[kb([[cb_btn("⬅️ К активным заказам", "admin:orders")]])])
-            return
-        buttons = []
-        for order in orders:
-            buttons.append([cb_btn(
-                f"№{order['id']} · {order['name'] or 'Клиент'} · {order['total']} ₽",
-                f"admin:order:{order['id']}")])
-        buttons.append([cb_btn("🔄 Обновить", f"admin:orders:{status}")])
-        buttons.append([cb_btn("⬅️ К активным заказам", "admin:orders")])
-        await ack()
-        await api.send(chat_id,
-                       f"{STATUS_LABELS.get(status, status)}\nЗаказов: {len(orders)}",
-                       attachments=[kb(buttons)])
-        return
-
-    if payload.startswith("admin:order:") and is_admin(user_id):
-        try:
-            order_id = int(payload.rsplit(":", 1)[1])
-        except ValueError:
-            await ack("Некорректный номер заказа")
-            return
+        await order_set_status(order_id, new_status)
+        await ack(f"Статус: {STATUS_LABELS[new_status]}")
         order = await order_get(order_id)
-        if not order:
-            await ack("Заказ не найден")
+        if order:
+            try:
+                await api.send_to_user(
+                    order["user_id"],
+                    f"📦 Статус заказа #{order_id}: {STATUS_LABELS[new_status]}")
+            except Exception:
+                log.exception("Не удалось уведомить клиента о статусе #%s", order_id)
+        return
+
+    if payload.startswith("mgr:"):
+        if not is_manager(user_id):
+            await ack("Нет доступа")
             return
-        detail = (
-            f"📦 **Заказ №{order['id']}**\n"
-            f"Статус: {STATUS_LABELS.get(order['status'], order['status'])}\n"
-            f"Клиент: {order['name']} (@{order['username']}, ID: {order['user_id']})\n"
-            f"Телефон: {order['phone']}\nАдрес: {order['address']}\n"
-            f"Время: {order['delivery_time'] or '—'}\n"
-            f"Комментарий: {order['comment'] or '—'}\n\n"
-            f"{order['items']}\n\nИтого: **{order['total']} ₽**\n"
-            f"Создан: {order['created_at']}"
-        )
-        await ack()
-        await api.send(chat_id, detail, attachments=[kb([
-            [cb_btn("🔄 Обновить заказ", f"admin:order:{order_id}")],
-            [cb_btn("⬅️ К активным заказам", "admin:orders")],
-            [cb_btn("⬅️ В админ-панель", "admin:back")],
-        ])])
-        return
-
-    if payload == "admin:back" and is_admin(user_id):
-        await ack()
-        await api.send(chat_id, "Админ-панель:", attachments=[admin_panel_keyboard()])
-        return
-
-    if payload.startswith("pickcat:") and is_admin(user_id):
-        cat_key = payload.split(":")[1]
-        data = st_data(user_id)
-        data["category_key"] = cat_key
-        st_set(user_id, "admin_add_photo", **data)
-        await ack()
-        await api.send(chat_id, "Фото блюда (или «пропустить»):")
-        return
-
-    if payload.startswith("aedit:") and is_admin(user_id):
-        _, key, field = payload.split(":", 2)
-        item = await menu_get(key)
-        if not item:
-            await ack("Не найдено")
-            return
-        if field == "category_key":
-            cats = await categories_all()
-            buttons = [[cb_btn(c["display_name"] or c["name"],
-                               f"setcat:{key}:{c['key']}")] for c in cats]
-            buttons.append([cb_btn("Отмена", "admin_cancel")])
-            await ack()
-            await api.send(chat_id, "Выберите категорию:", attachments=[kb(buttons)])
-            return
-        st_set(user_id, "admin_edit_value", key=key, field=field)
-        prompts = {"name": "Новое название:", "price": "Новая цена:",
-                   "description": "Новое описание:",
-                   "photo_token": "Пришлите новое фото:"}
-        await ack()
-        await api.send(chat_id, prompts.get(field, "Новое значение:"))
-        return
-
-    if payload.startswith("setcat:") and is_admin(user_id):
-        _, key, cat_key = payload.split(":", 2)
-        await menu_update(key, "category_key", cat_key)
-        await ack()
-        await api.send(chat_id, f"✅ Категория блюда {key} изменена на {cat_key}.")
-        return
-
-    if payload.startswith("atoggle:") and is_admin(user_id):
-        _, key, action = payload.split(":")
-        new_active = 1 if action == "show" else 0
-        await menu_update(key, "active", new_active)
-        await ack(f"Блюдо {'показано' if new_active else 'скрыто'}")
-        await api.send(chat_id,
-                       f"✅ Блюдо {key} {'показано' if new_active else 'скрыто'}.")
-        return
-
-    if payload.startswith("adel:") and is_admin(user_id):
-        key = payload.split(":")[1]
-        await menu_delete(key)
-        await ack()
-        await api.send(chat_id, f"🗑 Блюдо {key} удалено.")
-        return
-
-    # ===== Менеджер =====
-    if payload.startswith("mgr:") and is_manager(user_id):
         status = payload.split(":")[1]
-        orders = await orders_by_status(status, limit=10)
+        orders = await orders_by_status(status, limit=20)
         if not orders:
-            await ack(f"{STATUS_LABELS.get(status, status)}: заказов нет.")
+            await ack("Нет заказов")
             return
         await ack()
         for o in orders:
-            text = (f"Заказ #{o['id']} — "
-                    f"{STATUS_LABELS.get(o['status'], o['status'])}\n"
-                    f"Клиент: {o['name']} (@{o['username']}, ID: {o['user_id']})\n"
-                    f"Тел: {o['phone']}\nАдрес: {o['address']}\n"
-                    f"⏰ Время: {o['delivery_time'] or '—'}\n"
-                    f"Коммент: {o['comment']}\n\n{o['items']}\n\n"
-                    f"Итого: {o['total']} ₽\nСоздан: {o['created_at']}")
+            text = (f"#{o['id']} — {o['total']} ₽\n"
+                    f"Клиент: {o['name']} ({o['phone']})\n"
+                    f"Адрес: {o['address']}\n"
+                    f"Время: {o['delivery_time']}\n"
+                    f"Коммент: {o['comment'] or '—'}")
             await api.send(chat_id, text,
                            attachments=[manager_keyboard(o["id"], o["status"])])
         return
 
-    if payload.startswith("setstatus:") and is_manager(user_id):
-        _, order_id, new_status = payload.split(":")
-        order_id = int(order_id)
-        order = await order_get(order_id)
-        if not order:
-            await ack("Заказ не найден")
+    if payload.startswith("admin:"):
+        if not is_admin(user_id):
+            await ack("Нет доступа")
             return
-        previous_status = order["status"]
-        allowed_transitions = {
-            "new": {"cooking"},
-            "paid": {"cooking"},
-            "cooking": {"delivering"},
-            "delivering": {"done"},
-        }
-        if new_status not in allowed_transitions.get(previous_status, set()):
-            await ack("Это изменение статуса недоступно. Отмену заказа выполняет клиент до начала приготовления.")
+        action = payload.split(":", 1)[1]
+
+        if action == "back":
+            await ack()
+            await api.send(chat_id, "Админ-панель:",
+                           attachments=[admin_panel_keyboard()])
             return
-        await order_set_status(order_id, new_status)
-        new_text = (f"Заказ #{order['id']} — "
-                    f"{STATUS_LABELS.get(new_status, new_status)}\n"
-                    f"Клиент: {order['name']} (@{order['username']}, "
-                    f"ID: {order['user_id']})\n"
-                    f"Тел: {order['phone']}\nАдрес: {order['address']}\n"
-                    f"⏰ Время: {order['delivery_time'] or '—'}\n"
-                    f"Коммент: {order['comment']}\n\n{order['items']}\n\n"
-                    f"Итого: {order['total']} ₽\nСоздан: {order['created_at']}")
-        await ack("Статус обновлён")
-        await api.send(chat_id, new_text,
-                       attachments=[manager_keyboard(order_id, new_status)])
-        notify_texts = {
-            "paid": "💳 Кассир отметил оплату вашего заказа.",
-            "cooking": "👨‍🍳 Ваш заказ уже готовится!",
-            "delivering": "🛵 Ваш заказ уже везёт курьер!",
-            "done": "✅ Заказ доставлен! Приятного аппетита!",
-            "cancelled": "❌ Заказ отменён. Свяжитесь с кассиром, "
-                         "если это ошибка.",
-        }
-        if new_status in notify_texts and new_status != previous_status:
+
+        if action == "add":
+            st_set(user_id, "admin_add_key")
+            await ack()
+            await api.send(chat_id, "Латинский ключ блюда (например, burger):")
+            return
+
+        if action == "list":
+            items = await menu_all(active_only=False)
+            if not items:
+                await ack("Меню пустое")
+                return
+            await ack()
+            buttons = [[cb_btn(item_label(i), f"aitem:{i['key']}")] for i in items]
+            buttons.append([cb_btn("⬅️ В админ-панель", "admin:back")])
+            await api.send(chat_id, "📋 Все блюда:", attachments=[kb(buttons)])
+            return
+
+        if action == "cats":
+            cats = await categories_all()
+            await ack()
+            buttons = [[cb_btn(f"{c['display_name'] or c['name']} ({c['key']})",
+                               f"acat:{c['key']}")] for c in cats]
+            buttons.append([cb_btn("⬅️ В админ-панель", "admin:back")])
+            await api.send(chat_id, "🗂 Категории:", attachments=[kb(buttons)])
+            return
+
+        if action == "cat_add":
+            st_set(user_id, "admin_cat_key")
+            await ack()
+            await api.send(chat_id, "Латинский ключ категории (например, desserts):")
+            return
+
+        if action == "cat_del":
+            cats = await categories_visible()
+            await ack()
+            buttons = [[cb_btn(f"🗑 {c['display_name'] or c['name']}",
+                               f"acatdel:{c['key']}")] for c in cats]
+            buttons.append([cb_btn("⬅️ В админ-панель", "admin:back")])
+            await api.send(chat_id, "Выберите категорию для удаления:",
+                           attachments=[kb(buttons)])
+            return
+
+        if action == "manager_id":
+            st_set(user_id, "admin_manager_id")
+            await ack()
+            await api.send(chat_id, "Введите числовой ID кассира (из /myid):")
+            return
+
+        if action == "orders":
+            orders = await orders_by_status("new", limit=20)
+            await ack()
+            if not orders:
+                await api.send(chat_id, "Активных заказов нет.",
+                               attachments=[kb([[cb_btn("⬅️ В админ-панель", "admin:back")]])])
+                return
+            for o in orders:
+                text = (f"#{o['id']} — {o['total']} ₽\n"
+                        f"Клиент: {o['name']} ({o['phone']})\n"
+                        f"Адрес: {o['address']}")
+                await api.send(chat_id, text,
+                               attachments=[manager_keyboard(o["id"], o["status"])])
+            return
+
+        if action == "orders_clear_confirm":
+            await ack()
+            await api.send(chat_id, "⚠️ Удалить все заказы? Это необратимо.",
+                           attachments=[kb([
+                               [cb_btn("✅ Да, удалить", "admin:orders_clear")],
+                               [cb_btn("⬅️ Отмена", "admin:back")]
+                           ])])
+            return
+
+        if action == "orders_clear":
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("DELETE FROM orders")
+                await db.execute("DELETE FROM order_items")
+                await db.commit()
+            await ack("Заказы удалены")
+            await api.send(chat_id, "🧹 Все заказы удалены.",
+                           attachments=[admin_panel_keyboard()])
+            return
+
+        if action == "stats":
+            all_time, today = await stats_summary()
+            top = await sales_top(limit=5)
+            text = (f"📈 **Статистика**\n\n"
+                    f"Всего заказов: {all_time['cnt']}\n"
+                    f"Выручка: {all_time['revenue']:.2f} ₽\n\n"
+                    f"Сегодня заказов: {today['cnt']}\n"
+                    f"Выручка сегодня: {today['revenue']:.2f} ₽\n\n"
+                    "**Топ блюд:**")
+            for t in top:
+                item = await menu_get(t["item_key"])
+                name = item["name"] if item else t["item_key"]
+                text += f"\n• {name} — {t['total_qty']} шт."
+            await ack()
+            await api.send(chat_id, text,
+                           attachments=[kb([[cb_btn("⬅️ В админ-панель", "admin:back")]])])
+            return
+
+        if action == "yk":
+            if yookassa_configured():
+                await ack()
+                await api.send(chat_id,
+                               f"✅ ЮKassa настроена.\nShop ID: {YOOKASSA_SHOP_ID}",
+                               attachments=[admin_panel_keyboard()])
+            else:
+                await ack()
+                await api.send(chat_id,
+                               "⚠️ ЮKassa не настроена. Задайте переменные окружения "
+                               "YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY на хостинге.",
+                               attachments=[admin_panel_keyboard()])
+            return
+
+        if action == "excel":
+            st_set(user_id, "admin_excel")
+            await ack()
+            await api.send(chat_id, "Пришлите .xlsx файл как документ. Для отмены — «отмена».")
+            return
+
+        if action == "bulk_photos":
+            st_set(user_id, "admin_bulk_photos")
+            await ack()
+            await api.send(chat_id,
+                           "Пришлите фотографии блюд. Имя файла = название блюда. "
+                           "Когда закончите — «готово».")
+            return
+
+        if action == "backup":
+            await ack()
+            if not os.path.exists(DB_PATH):
+                await api.send(chat_id, "Файл БД не найден.")
+                return
             try:
-                done_attachments = (
-                    [kb([[cb_btn("🛍 Заказать снова", "main_menu")]])]
-                    if new_status == "done" else None
-                )
-                await api.send_to_user(
-                    order["user_id"], notify_texts[new_status],
-                    attachments=done_attachments)
-                if new_status == "done":
-                    rated_items = await order_rating_items(order_id)
-                    if rated_items:
-                        rating_buttons = []
-                        for rated_item in rated_items:
-                            item_name = rated_item["name"] or rated_item["item_key"]
-                            rating_buttons.append([cb_btn(
-                                f"🍽 {item_name[:32]}",
-                                f"rateitem:{order_id}:{rated_item['item_key']}")])
-                        await api.send_to_user(
-                            order["user_id"],
-                            f"🍽 **Заказ #{order_id} доставлен!**\n"
-                            "Спасибо, что выбрали нас! Выберите блюдо, чтобы поставить ему оценку. "
-                            "Сначала выберите блюдо, затем нажмите от 1 до 5 звёзд. "
-                            "Оценку можно изменить в любое время.",
-                            attachments=[kb(rating_buttons)])
+                with open(DB_PATH, "rb") as f:
+                    db_bytes = f.read()
+                token = await api.upload_bytes(db_bytes, "file", filename="shop.db")
+                if token:
+                    await api.send(chat_id, "💾 Резервная копия БД:",
+                                   attachments=[{"type": "file",
+                                                 "payload": {"token": token}}])
+                else:
+                    await api.send(chat_id, "Не удалось загрузить файл БД в MAX.")
             except Exception:
-                log.exception("Не удалось отправить клиенту уведомление о статусе заказа #%s",
-                              order_id)
+                log.exception("Ошибка резервного копирования БД")
+                await api.send(chat_id, "Ошибка при создании резервной копии.")
+            return
+
+        if action == "menu_clear_confirm":
+            await ack()
+            await api.send(chat_id, "⚠️ Удалить всё меню? Это необратимо.",
+                           attachments=[kb([
+                               [cb_btn("✅ Да, удалить", "admin:menu_clear")],
+                               [cb_btn("⬅️ Отмена", "admin:back")]
+                           ])])
+            return
+
+        if action == "menu_clear":
+            await menu_delete_all()
+            await ack("Меню удалено")
+            await api.send(chat_id, "🗑 Всё меню удалено.",
+                           attachments=[admin_panel_keyboard()])
+            return
+
+        await ack("Неизвестное действие")
+        return
+
+    if payload.startswith("aitem:"):
+        if not is_admin(user_id):
+            await ack("Нет доступа")
+            return
+        key = payload.split(":", 1)[1]
+        item = await menu_get(key)
+        if not item:
+            await ack("Блюдо не найдено")
+            return
+        await ack()
+        text = (f"**{item['name']}** — {item['price']} ₽\n"
+                f"{item['description'] or 'Без описания'}\n"
+                f"Категория: {item['category_key']}\n"
+                f"Активно: {'да' if item['active'] else 'нет'}")
+        await api.send(chat_id, text,
+                       attachments=[admin_item_keyboard(key, bool(item["active"]))])
+        return
+
+    if payload.startswith("aedit:"):
+        if not is_admin(user_id):
+            await ack("Нет доступа")
+            return
+        parts = payload.split(":")
+        if len(parts) != 3:
+            await ack("Ошибка")
+            return
+        _, key, field = parts
+        st_set(user_id, "admin_edit_value", key=key, field=field)
+        await ack()
+        prompts = {
+            "name": "Новое название:",
+            "price": "Новая цена (число):",
+            "description": "Новое описание:",
+            "photo_token": "Пришлите новое фото:",
+            "category_key": "Новый ключ категории:",
+        }
+        await api.send(chat_id, prompts.get(field, "Новое значение:"))
+        return
+
+    if payload.startswith("atoggle:"):
+        if not is_admin(user_id):
+            await ack("Нет доступа")
+            return
+        parts = payload.split(":")
+        if len(parts) != 3:
+            await ack("Ошибка")
+            return
+        _, key, action = parts
+        new_active = 0 if action == "hide" else 1
+        await menu_update(key, "active", new_active)
+        await ack("Скрыто" if new_active == 0 else "Показано")
+        item = await menu_get(key)
+        if item:
+            await api.send(chat_id, f"Блюдо «{item['name']}» обновлено.",
+                           attachments=[admin_item_keyboard(key, bool(new_active))])
+        return
+
+    if payload.startswith("adel:"):
+        if not is_admin(user_id):
+            await ack("Нет доступа")
+            return
+        key = payload.split(":", 1)[1]
+        await menu_delete(key)
+        await ack("Удалено")
+        await api.send(chat_id, "🗑 Блюдо удалено.",
+                       attachments=[admin_panel_keyboard()])
+        return
+
+    if payload.startswith("acat:"):
+        if not is_admin(user_id):
+            await ack("Нет доступа")
+            return
+        key = payload.split(":", 1)[1]
+        st_set(user_id, "admin_cat_rename", key=key)
+        await ack()
+        await api.send(chat_id, "Введите новое название категории:")
+        return
+
+    if payload.startswith("acatdel:"):
+        if not is_admin(user_id):
+            await ack("Нет доступа")
+            return
+        key = payload.split(":", 1)[1]
+        await category_delete(key)
+        await ack("Категория удалена")
+        await api.send(chat_id, "🗑 Категория удалена.",
+                       attachments=[admin_panel_keyboard()])
+        return
+
+    if payload.startswith("pickcat:"):
+        data = st_data(user_id)
+        data["category_key"] = payload.split(":", 1)[1]
+        st_set(user_id, "admin_add_photo", **data)
+        await ack()
+        await api.send(chat_id, "Пришлите фото блюда или напишите «пропустить»:")
+        return
+
+    if payload == "admin_cancel":
+        st_clear(user_id)
+        await ack("Отменено")
+        await api.send(chat_id, "Действие отменено.",
+                       attachments=[admin_panel_keyboard()])
         return
 
     await ack()
 
-# ================= РОЛИ =================
-def is_manager(user_id):
-    return user_id == MANAGER_CHAT_ID or user_id in ADMIN_IDS
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-# ================= ГЛАВНЫЙ ЦИКЛ =================
-async def _handle_bot_started(update):
-    """Обработка нажатия системной кнопки «Старт» в MAX.
-    Форматы bot_started могут отличаться: поддерживаем несколько вариантов полей.
-    """
-    user_obj = (update.get("user") or update.get("sender")
-                or update.get("from") or {})
-    if not isinstance(user_obj, dict):
-        user_obj = {}
-    user_id = (user_obj.get("user_id") or user_obj.get("id")
-               or update.get("user_id") or update.get("sender_id"))
-    msg = update.get("message") or {}
-    recipient = msg.get("recipient") or {}
-    chat_obj = update.get("chat") or {}
-    chat_id = (update.get("chat_id") or recipient.get("chat_id")
-               or msg.get("chat_id") or chat_obj.get("chat_id") or user_id)
+# ================= ВСПОМОГАТЕЛЬНЫЕ ПРОВЕРКИ ДОСТУПА =================
+def is_manager(user_id) -> bool:
     try:
-        user_id = int(user_id) if user_id is not None else None
-        chat_id = int(chat_id) if chat_id is not None else None
+        return int(user_id) in ADMIN_IDS or int(user_id) == MANAGER_CHAT_ID
     except (TypeError, ValueError):
-        log.warning("bot_started: не удалось разобрать ID: %r", update)
-        return
-
-    if chat_id is None:
-        log.warning("bot_started без chat_id: %r", update)
-        return
-
-    if user_id is not None:
-        await remember_user_chat(user_id, chat_id)
-        existing_user = await get_user(user_id)
-        if existing_user and existing_user["agreed_offer"]:
-            st_clear(user_id)
-            await send_menu(chat_id)
-        else:
-            st_set(user_id, "waiting_offer")
-            await send_offer_screen(chat_id)
-    else:
-        # Даже если MAX не прислал user_id, отвечаем в известный чат,
-        # чтобы пользователь не видел полностью молчащий запуск.
-        await send_offer_screen(chat_id)
-    log.info("Обработан bot_started user_id=%s chat_id=%s", user_id, chat_id)
+        return False
 
 
-async def poll_loop():
-    marker = None
-    log.info("Бот запущен. Long polling активен.")
-    while True:
-        resp = await api.get_updates(marker=marker, timeout=30)
-        if resp is None:
-            await asyncio.sleep(5)
-            continue
-        if not isinstance(resp, dict):
-            log.error("Некорректный ответ /updates: %r", resp)
-            await asyncio.sleep(3)
-            continue
-        marker = resp.get("marker", marker)
-        updates = resp.get("updates") or []
-        for update in updates:
-            if not isinstance(update, dict):
-                continue
-            ut = update.get("update_type") or update.get("type")
-            try:
-                if ut == "message_created":
-                    await handle_message(update.get("message") or {})
-                elif ut == "message_callback":
-                    await handle_callback(update)
-                elif ut == "bot_started":
-                    await _handle_bot_started(update)
-                else:
-                    log.info("Пропущено неизвестное обновление type=%r keys=%s",
-                             ut, list(update.keys()))
-            except Exception:
-                log.exception("Ошибка обработки обновления type=%r update=%r",
-                              ut, update)
-
-async def main():
-    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬ_ТОКЕН":
-        raise SystemExit("Не задан MAX_BOT_TOKEN — добавьте переменную окружения "
-                         "на bothost.ru (MAX_TOKEN / MAX_BOT_TOKEN).")
-    await init_db()
-    if yookassa_configured():
-        log.info("ЮKassa: переменные окружения обнаружены (shopId %s)", YOOKASSA_SHOP_ID)
-        pending = await orders_pending_yookassa()
-        for row in pending:
-            asyncio.create_task(_yk_watch(int(row["id"]), row["payment_id"]))
-        if pending:
-            log.info("ЮKassa: возобновлён контроль %d незавершённых платежей", len(pending))
-    await api.start()
-    me = await api._request("GET", "/me")
-    if me:
-        log.info("Токен подтверждён: бот %s", me.get("name", me))
-    else:
-        log.warning("Не удалось получить /me — проверьте токен, но продолжаем.")
+def is_admin(user_id) -> bool:
     try:
-        await poll_loop()
+        return int(user_id) in ADMIN_IDS
+    except (TypeError, ValueError):
+        return False
+
+
+# ================= ЗАПУСК =================
+async def main():
+    await init_db()
+    await api.start()
+    try:
+        # Подхватываем незавершённые платежи после перезапуска.
+        for row in await orders_pending_yookassa():
+            asyncio.create_task(_yk_watch(row["id"], row["payment_id"]))
+        marker = None
+        log.info("Бот запущен. Ожидаю события MAX...")
+        while True:
+            try:
+                data = await api.get_updates(marker=marker, timeout=30)
+                if not data:
+                    continue
+                marker = data.get("marker", marker)
+                for update in data.get("updates", []):
+                    utype = update.get("update_type") or update.get("type")
+                    try:
+                        if utype == "message_created":
+                            await handle_message(update.get("message") or update)
+                        elif utype == "message_callback":
+                            await handle_callback(update)
+                        elif utype == "bot_started":
+                            # bot_started можно обрабатывать как /start
+                            msg = update.get("message") or {}
+                            if not msg:
+                                msg = {"sender": update.get("user") or {},
+                                       "recipient": update.get("chat") or {},
+                                       "body": {"text": "/start"}}
+                            await handle_message(msg)
+                    except Exception:
+                        log.exception("Ошибка обработки update: %r", update)
+            except Exception:
+                log.exception("Ошибка в главном цикле long polling")
+                await asyncio.sleep(5)
     finally:
         await api.stop()
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Бот остановлен пользователем")
