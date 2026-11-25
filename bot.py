@@ -58,7 +58,7 @@ def is_admin_user(user_id):
     except (TypeError, ValueError):
         return False
 
-FREE_DELIVERY_FROM = Decimal("1000")
+FREE_DELIVERY_FROM = Decimal("3000")
 DELIVERY_COST = Decimal("200")
 
 DB_PATH = os.getenv("DB_PATH", "data/shop.db")
@@ -2749,6 +2749,9 @@ async def handle_callback(update):
             return
         if await category_requires_garnish(item["category_key"]):
             await ack()
+            # Один запрос гарнира = один выбор: повторные нажатия кнопок
+            # на этой же карточке игнорируются (см. обработчик garnish:).
+            st_set(user_id, "await_garnish", item_key=key, consumed=False)
             await api.send(chat_id,
                            f"Выберите гарнир к «{item['name']}»:",
                            attachments=[garnish_keyboard(key)])
@@ -2764,6 +2767,17 @@ async def handle_callback(update):
             await ack("Ошибка")
             return
         _, key, garnish = parts
+        # Гарнир выбирается один раз на один запрос: если по этой карточке
+        # выбор уже сделан — повторные нажатия (в том числе на другой гарнир)
+        # не добавляют блюдо второй раз.
+        _st = st_get(user_id)
+        _st_data = _st.get("data") or {}
+        if (_st.get("state") != "await_garnish"
+                or _st_data.get("item_key") != key
+                or _st_data.get("consumed")):
+            await ack("Гарнир для этого блюда уже выбран. Чтобы добавить то же "
+                      "блюдо с другим гарниром — нажмите «Добавить в корзину» ещё раз.")
+            return
         item = await menu_get(key)
         if not item:
             await ack("Блюдо недоступно")
@@ -2771,7 +2785,17 @@ async def handle_callback(update):
         await cancel_pending_user_payments(user_id, chat_id)
         await cart_add(user_id, key, garnish)
         await set_garnish(user_id, key, garnish)
+        # Закрываем запрос: та же карточка больше не принимает нажатия,
+        # а новое «Добавить в корзину» предложит выбрать гарнир заново.
+        st_set(user_id, "await_garnish", item_key=key, consumed=True)
         await ack("Добавлено в корзину")
+        # Автоматически возвращаем предыдущее меню — категорию выбранного блюда.
+        _items = await menu_all(category_key=item["category_key"],
+                                in_stock_only=True)
+        if _items:
+            await api.send(chat_id, "МЕНЮ",
+                           attachments=[menu_keyboard(_items,
+                                                      item["category_key"])])
         return
 
     if payload.startswith("fav:"):
