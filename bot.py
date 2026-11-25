@@ -14,6 +14,7 @@ import sqlite3
 import io
 import re
 import json
+import base64
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -280,7 +281,9 @@ async def init_db():
                          ("created_at", "TIMESTAMP"),
                          ("username", "TEXT"),
                          ("delivery_time", "TEXT"),
-                         ("courier_id", "INTEGER")]:
+                         ("courier_id", "INTEGER"),
+                         ("discount_percent", "TEXT DEFAULT '0'"),
+                         ("payment_url", "TEXT")]:
             if col not in ocols:
                 await db.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
 
@@ -328,6 +331,10 @@ async def get_user(user_id: int):
             return await cur.fetchone()
 
 async def save_user(user_id, name, phone, address):
+    if phone and str(phone).strip() != "—":
+        normalized = normalize_phone(phone)
+        if normalized:
+            phone = normalized
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, name, phone, address, agreed_offer)
@@ -554,63 +561,118 @@ async def _yk_http():
         _yk_session = aiohttp.ClientSession()
     return _yk_session
 
-def _yk_phone(raw):
-    """Приводит телефон к виду +7XXXXXXXXXX или возвращает None."""
+def _yk_auth_headers(extra=None):
+    """Заголовок Basic Auth без устаревшего aiohttp.BasicAuth."""
+    creds = base64.b64encode(
+        f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode("utf-8")
+    ).decode("ascii")
+    headers = {"Authorization": f"Basic {creds}"}
+    if extra:
+        headers.update(extra)
+    return headers
+
+def normalize_phone(raw):
+    """Автоматически приводит введённый номер к формату +7XXXXXXXXXX или возвращает None."""
     digits = re.sub(r"\D", "", str(raw or ""))
-    if len(digits) == 11 and digits[0] == "8":
+    if len(digits) == 14 and digits.startswith("8107"):
+        digits = digits[3:]
+    elif len(digits) == 13 and digits.startswith("007"):
+        digits = digits[2:]
+    elif len(digits) == 12 and digits[:2] in ("78", "77") and digits[2] == "9":
+        digits = "7" + digits[2:]
+    elif len(digits) == 11 and digits[0] == "8":
         digits = "7" + digits[1:]
-    if len(digits) == 10:
+    elif len(digits) == 10:
         digits = "7" + digits
     if len(digits) == 11 and digits[0] == "7":
         return "+" + digits
     return None
+
+def _yk_phone(raw):
+    """Псевдоним normalize_phone для совместимости с ЮKassa."""
+    return normalize_phone(raw)
 
 def _money(value):
     return str(Decimal(value).quantize(Decimal("0.01")))
 
 def _yk_build_receipt(receipt_lines, discount_rate, delivery_cost, final_total):
     """Собирает позиции чека 54-ФЗ: каждое блюдо (со скидкой) + доставка.
-    Сумма позиций чека обязана совпадать с суммой платежа, поэтому последняя
-    крупная позиция корректируется на копейки округления."""
+    В ЮKassa API v3 поле receipt.items[].amount — это ЦЕНА ЗА ЕДИНИЦУ товара,
+    а не сумма всей строки (ЮKassa сама умножает amount на quantity).
+    Сумма (amount * quantity) по всем позициям обязана совпадать с суммой платежа."""
     if not receipt_lines:
         return None
-    sums = []
+    expected_total = Decimal(_money(final_total))
+    expected_delivery = Decimal(_money(delivery_cost))
+    expected_goods = (expected_total - expected_delivery).quantize(Decimal("0.01"))
+
+    entries = []
     for name, qty, price in receipt_lines:
-        sums.append((price * qty * (Decimal("1") - discount_rate))
-                    .quantize(Decimal("0.01")))
-    expected_goods = final_total - delivery_cost
-    diff = (expected_goods - sum(sums)).quantize(Decimal("0.01"))
-    if diff != 0 and max(sums) + diff > 0:
-        sums[sums.index(max(sums))] += diff
+        q = Decimal(qty)
+        if q <= 0:
+            continue
+        unit_price = (Decimal(price) * (Decimal("1") - Decimal(discount_rate))).quantize(Decimal("0.01"))
+        entries.append([str(name)[:128], q, unit_price])
+
+    if not entries:
+        return None
+
+    goods_sum = sum((u * q for _, q, u in entries), Decimal("0")).quantize(Decimal("0.01"))
+    diff = (expected_goods - goods_sum).quantize(Decimal("0.01"))
+    if diff != 0:
+        # Сначала пробуем скорректировать позицию с количеством 1 шт.
+        adjusted = False
+        for entry in entries:
+            if entry[1] == Decimal("1") and entry[2] + diff > 0:
+                entry[2] = (entry[2] + diff).quantize(Decimal("0.01"))
+                adjusted = True
+                break
+        if not adjusted:
+            # Если все позиции с qty > 1 — отделяем 1 единицу для точной корректировки копеек.
+            candidates = [i for i, e in enumerate(entries) if e[1] > Decimal("1") and e[2] + diff > 0]
+            if candidates:
+                idx = max(candidates, key=lambda i: entries[i][2])
+                name_i, qty_i, unit_i = entries[idx]
+                entries[idx][1] = qty_i - Decimal("1")
+                entries.insert(idx + 1, [name_i, Decimal("1"), (unit_i + diff).quantize(Decimal("0.01"))])
+
+    fallback_receipt = [{
+        "description": f"Заказ — {YOOKASSA_NAME}",
+        "quantity": "1.00",
+        "amount": {"value": _money(expected_total), "currency": "RUB"},
+        "payment_mode": "full_prepayment",
+        "payment_subject": "commodity",
+        "vat_code": 1,
+    }]
+
     items = []
-    for (name, qty, price), value in zip(receipt_lines, sums):
-        if value <= 0:
-            # Не удалось корректно распределить — отдаём заказ одной позицией.
-            return [{
-                "description": f"Заказ — {YOOKASSA_NAME}",
-                "quantity": "1.00",
-                "amount": {"value": _money(final_total), "currency": "RUB"},
-                "payment_mode": "full_prepayment",
-                "payment_subject": "commodity",
-                "vat_code": 1,
-            }]
+    check_sum = Decimal("0")
+    for name, qty, unit_price in entries:
+        if unit_price <= 0 or qty <= 0:
+            return fallback_receipt
         items.append({
-            "description": str(name)[:128],
+            "description": name,
             "quantity": f"{qty:.2f}",
-            "amount": {"value": _money(value), "currency": "RUB"},
+            "amount": {"value": _money(unit_price), "currency": "RUB"},
             "payment_mode": "full_prepayment",
             "payment_subject": "commodity",
             "vat_code": 1,  # без НДС
         })
-    if delivery_cost > 0:
+        check_sum += (unit_price * qty).quantize(Decimal("0.01"))
+
+    if expected_delivery > 0:
         items.append({
             "description": "Доставка заказа",
             "quantity": "1.00",
-            "amount": {"value": _money(delivery_cost), "currency": "RUB"},
+            "amount": {"value": _money(expected_delivery), "currency": "RUB"},
             "payment_mode": "full_prepayment",
             "payment_subject": "service",
             "vat_code": 1,
         })
+        check_sum += expected_delivery
+
+    if check_sum.quantize(Decimal("0.01")) != expected_total:
+        return fallback_receipt
     return items
 
 async def yookassa_create_payment(order_id, amount, description, receipt_items, phone=None):
@@ -627,17 +689,21 @@ async def yookassa_create_payment(order_id, amount, description, receipt_items, 
     if receipt_items:
         receipt = {"items": receipt_items, "taxation_system_code": 6}  # 6 = АУСН
         ph = _yk_phone(phone)
-        if ph:
-            receipt["customer"] = {"phone": ph}
+        if not ph:
+            log.error("ЮKassa: для заказа #%s не передан корректный телефон покупателя", order_id)
+            return None
+        receipt["customer"] = {"phone": ph}
         body["receipt"] = receipt
-    headers = {"Idempotence-Key": uuid.uuid4().hex, "Content-Type": "application/json"}
+    headers = _yk_auth_headers({
+        "Idempotence-Key": uuid.uuid4().hex,
+        "Content-Type": "application/json",
+    })
     try:
         session = await _yk_http()
         async with session.post(
             f"{YOOKASSA_API_URL}/payments",
             json=body,
             headers=headers,
-            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             data = await resp.json(content_type=None)
@@ -656,7 +722,7 @@ async def yookassa_get_payment(payment_id):
         session = await _yk_http()
         async with session.get(
             f"{YOOKASSA_API_URL}/payments/{payment_id}",
-            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            headers=_yk_auth_headers(),
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             data = await resp.json(content_type=None)
@@ -670,8 +736,7 @@ async def yookassa_cancel_payment(payment_id):
         session = await _yk_http()
         async with session.post(
             f"{YOOKASSA_API_URL}/payments/{payment_id}/cancel",
-            headers={"Idempotence-Key": uuid.uuid4().hex},
-            auth=aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            headers=_yk_auth_headers({"Idempotence-Key": uuid.uuid4().hex}),
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             return resp.status == 200
@@ -680,18 +745,20 @@ async def yookassa_cancel_payment(payment_id):
         return False
 
 async def _yk_cancel_after_cancel_order(payment_id, order_id):
-    """Если клиент отменил заказ до оплаты — отменяем и платёж в ЮKassa."""
+    """Если клиент отменил или пересоздал заказ до оплаты — пробуем отменить старый платёж в ЮKassa."""
     payment = await yookassa_get_payment(payment_id)
-    if payment and payment.get("status") == "pending":
+    if payment and payment.get("status") == "waiting_for_capture":
         ok = await yookassa_cancel_payment(payment_id)
-        log.info("ЮKassa: платёж %s отменённого заказа #%s — %s",
+        log.info("ЮKassa: платёж %s заказа #%s — %s",
                  payment_id, order_id, "отменён" if ok else "не отменён")
 
 # ================= ЮKASSA: ХРАНЕНИЕ ПЛАТЕЖА В БАЗЕ =================
-async def order_set_payment_id(order_id, payment_id):
+async def order_set_payment_id(order_id, payment_id, payment_url=None):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE orders SET payment_id = ? WHERE id = ?",
-                         (payment_id, order_id))
+        await db.execute(
+            "UPDATE orders SET payment_id = ?, payment_url = ? WHERE id = ?",
+            (payment_id, payment_url, order_id),
+        )
         await db.commit()
 
 async def orders_pending_yookassa():
@@ -705,7 +772,43 @@ async def orders_pending_yookassa():
             return await cur.fetchall()
 
 # ================= ЮKASSA: ФОНОВЫЙ КОНТРОЛЬ ОПЛАТЫ =================
-_yk_watching = set()
+_yk_watching = {}
+_yk_watch_tasks = {}
+_order_edit_locks = {}
+_order_ui_messages = {}
+
+def _order_edit_lock(order_id):
+    oid = int(order_id)
+    if oid not in _order_edit_locks:
+        _order_edit_locks[oid] = asyncio.Lock()
+    return _order_edit_locks[oid]
+
+def _remember_order_ui_message(order_id, chat_id, message_id):
+    if not message_id:
+        return
+    oid = int(order_id)
+    entries = _order_ui_messages.setdefault(oid, [])
+    pair = (int(chat_id), str(message_id))
+    if pair not in entries:
+        entries.append(pair)
+
+def _yk_stop_watch(order_id):
+    oid = int(order_id)
+    task = _yk_watch_tasks.pop(oid, None)
+    _yk_watching.pop(oid, None)
+    if task and not task.done():
+        task.cancel()
+
+def _yk_start_watch(order_id, payment_id):
+    oid = int(order_id)
+    if _yk_watching.get(oid) == payment_id:
+        existing = _yk_watch_tasks.get(oid)
+        if existing and not existing.done():
+            return existing
+    _yk_stop_watch(oid)
+    task = asyncio.create_task(_yk_watch(oid, payment_id))
+    _yk_watch_tasks[oid] = task
+    return task
 
 def _extract_message_id(result):
     """Достаёт идентификатор сообщения из ответа MAX API."""
@@ -762,6 +865,10 @@ async def _yk_notify_paid(order_id):
     await api.notify_staff(
         f"💳 Заказ #{order_id} оплачен через ЮKassa!\n"
         f"Клиент: {order['name']} (@{order['username']}, ID: {order['user_id']})\n"
+        f"Телефон: {order['phone']}\n"
+        f"Адрес: {order['address']}\n"
+        f"Время: {order['delivery_time']}\n\n"
+        f"{order['items']}\n\n"
         f"Сумма: {order['total']} ₽\n\n"
         "Заказ можно передавать на кухню.",
         attachments=[manager_keyboard(order_id, "paid")])
@@ -778,39 +885,49 @@ async def _yk_watch(order_id, payment_id):
     """Раз в YOOKASSA_POLL_INTERVAL секунд проверяет статус платежа в ЮKassa.
     При успехе сам переводит заказ в статус «оплачен» и уведомляет клиента и кассира.
     Переживает перезапуск бота: незавершённые платежи подхватываются в main()."""
-    if order_id in _yk_watching:
-        return
-    _yk_watching.add(order_id)
+    oid = int(order_id)
+    _yk_watching[oid] = payment_id
     try:
         deadline = asyncio.get_event_loop().time() + YOOKASSA_WATCH_HOURS * 3600
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(YOOKASSA_POLL_INTERVAL)
+            order = await order_get(oid)
+            if not order or order["status"] != "new" or order["payment_id"] != payment_id:
+                return
             payment = await yookassa_get_payment(payment_id)
             if not payment:
                 continue
             status = payment.get("status")
             if status == "succeeded":
-                order = await order_get(order_id)
-                if order and order["status"] == "new":
-                    await order_set_status(order_id, "paid")
-                    log.info("ЮKassa: заказ #%s оплачен (платёж %s)", order_id, payment_id)
-                    await _yk_notify_paid(order_id)
+                order = await order_get(oid)
+                if order and order["status"] == "new" and order["payment_id"] == payment_id:
+                    await order_set_status(oid, "paid")
+                    log.info("ЮKassa: заказ #%s оплачен (платёж %s)", oid, payment_id)
+                    await _yk_notify_paid(oid)
                 return
             if status == "canceled":
-                order = await order_get(order_id)
-                if order and order["status"] == "new":
+                order = await order_get(oid)
+                if order and order["status"] == "new" and order["payment_id"] == payment_id:
                     try:
                         await api.send_to_user(
                             order["user_id"],
-                            f"❌ Платёж по заказу #{order_id} не завершён или отменён.\n"
-                            "Оформите заказ заново или напишите кассиру.",
-                            attachments=[kb([[cb_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
+                            f"❌ Платёж по заказу #{oid} не завершён или отменён.\n"
+                            "Вы можете изменить количество блюд для создания новой ссылки или написать кассиру.",
+                            attachments=[kb([
+                                [cb_btn("✏️ Изменить количество блюд", f"editorder:{oid}")],
+                                [link_btn("💬 Написать кассиру", MANAGER_USERNAME)],
+                            ])])
                     except Exception:
-                        log.exception("Не удалось уведомить об отмене платежа #%s", order_id)
+                        log.exception("Не удалось уведомить об отмене платежа #%s", oid)
                 return
-        log.info("ЮKassa: наблюдение за платежом %s заказа #%s истекло", payment_id, order_id)
+        log.info("ЮKassa: наблюдение за платежом %s заказа #%s истекло", payment_id, oid)
+    except asyncio.CancelledError:
+        return
     finally:
-        _yk_watching.discard(order_id) 
+        if _yk_watching.get(oid) == payment_id:
+            _yk_watching.pop(oid, None)
+        if _yk_watch_tasks.get(oid) is asyncio.current_task():
+            _yk_watch_tasks.pop(oid, None)
 # ================= КАТЕГОРИИ И МЕНЮ =================
 async def categories_all():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1008,18 +1125,72 @@ async def is_favorite(user_id, item_key) -> bool:
             return await cur.fetchone() is not None
 
 # ================= ЗАКАЗЫ И СТАТИСТИКА =================
-async def order_save(user_id, username, data, items_text, total, delivery_time=None):
+async def order_save(user_id, username, data, items_text, total, delivery_time=None, discount_percent=Decimal("0")):
     now = datetime.now(TZ_YANAO).strftime("%Y-%m-%d %H:%M")
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             INSERT INTO orders (user_id, username, name, phone, address, comment,
-                                delivery_time, items, total, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                delivery_time, items, total, created_at, discount_percent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (user_id, username, data.get("name"), data.get("phone"),
               data.get("address"), data.get("comment", "—"),
-              delivery_time or "—", items_text, str(total), now))
+              delivery_time or "—", items_text, str(total), now, str(discount_percent)))
         await db.commit()
         return cur.lastrowid
+
+async def order_items_get_with_rowid(order_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT rowid AS row_id, order_id, item_key, garnish, quantity, price "
+            "FROM order_items WHERE order_id = ? ORDER BY rowid",
+            (order_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+async def order_item_get_by_rowid(order_id, row_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT rowid AS row_id, order_id, item_key, garnish, quantity, price "
+            "FROM order_items WHERE order_id = ? AND rowid = ?",
+            (order_id, row_id),
+        ) as cur:
+            return await cur.fetchone()
+
+async def order_item_change_qty(order_id, row_id, delta):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if delta > 0:
+            await db.execute(
+                "UPDATE order_items SET quantity = quantity + ? WHERE order_id = ? AND rowid = ?",
+                (int(delta), order_id, row_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE order_items SET quantity = quantity + ? WHERE order_id = ? AND rowid = ?",
+                (int(delta), order_id, row_id),
+            )
+            await db.execute(
+                "DELETE FROM order_items WHERE order_id = ? AND rowid = ? AND quantity <= 0",
+                (order_id, row_id),
+            )
+        await db.commit()
+
+async def order_item_delete_by_rowid(order_id, row_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM order_items WHERE order_id = ? AND rowid = ?",
+            (order_id, row_id),
+        )
+        await db.commit()
+
+async def order_update_details(order_id, items_text, total, payment_id, payment_url):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE orders SET items = ?, total = ?, payment_id = ?, payment_url = ? WHERE id = ?",
+            (items_text, str(total), payment_id, payment_url, order_id),
+        )
+        await db.commit()
 
 async def order_items_save(order_id, rows, garnishes: dict):
     saved = []
@@ -2235,16 +2406,20 @@ async def handle_message(message):
 
     # ===== Оформление заказа: имя/телефон/адрес/время/комментарий =====
     if sname == "edit_phone":
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) < 10:
-            await api.send(chat_id, "Некорректный номер. Введите ещё раз:")
+        normalized_phone = normalize_phone(text)
+        if not normalized_phone:
+            await api.send(
+                chat_id,
+                "Некорректный номер. Введите 10 или 11 цифр российского номера "
+                "(например, 89991234567 или 9991234567 — бот автоматически приведёт его к +7):"
+            )
             return
         user = await get_user(user_id)
         name = user["name"] if user and user["name"] else "Гость"
         address = user["address"] if user and user["address"] else "—"
-        await save_user(user_id, name, text, address)
+        await save_user(user_id, name, normalized_phone, address)
         st_clear(user_id)
-        await api.send(chat_id, f"✅ Телефон сохранён: {text}")
+        await api.send(chat_id, f"✅ Телефон сохранён: {normalized_phone}")
         return
 
     if sname == "edit_address":
@@ -2259,6 +2434,26 @@ async def handle_message(message):
         await api.send(chat_id, f"✅ Адрес сохранён: {text}")
         return
 
+    if sname == "waiting_phone_payment":
+        normalized_phone = normalize_phone(text)
+        if not normalized_phone:
+            await api.send(
+                chat_id,
+                "Некорректный номер. Введите 10 или 11 цифр российского номера "
+                "(например, 89991234567 или 9991234567 — бот автоматически приведёт его к +7):"
+            )
+            return
+        data = st_data(user_id)
+        data["phone"] = normalized_phone
+        user = await get_user(user_id)
+        name = data.get("name") or (user["name"] if user and user["name"] else "Гость")
+        address = data.get("address") or (user["address"] if user and user["address"] else "—")
+        await save_user(user_id, name, normalized_phone, address)
+        st_set(user_id, "waiting_comment", **data)
+        await api.send(chat_id, f"✅ Телефон сохранён: {normalized_phone}. Продолжаю оформление заказа.")
+        await finalize_order(chat_id, user_id, username)
+        return
+
     if sname == "waiting_name":
         if not text or len(text) < 2:
             await api.send(chat_id, "Укажите имя (мин. 2 символа):")
@@ -2270,21 +2465,28 @@ async def handle_message(message):
         address = user["address"] if user and user["address"] else "—"
         await save_user(user_id, text, phone, address)
         st_set(user_id, "waiting_phone", **data)
-        await api.send(chat_id, "Укажите номер телефона:")
+        await api.send(
+            chat_id,
+            "Укажите номер телефона (можно с 8 или без кода — бот автоматически приведёт к +7):"
+        )
         return
 
     if sname == "waiting_phone":
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) < 10:
-            await api.send(chat_id, "Некорректный номер. Введите ещё раз:")
+        normalized_phone = normalize_phone(text)
+        if not normalized_phone:
+            await api.send(
+                chat_id,
+                "Некорректный номер. Введите 10 или 11 цифр российского номера "
+                "(например, 89991234567 или 9991234567 — бот автоматически приведёт его к +7):"
+            )
             return
         data = st_data(user_id)
-        data["phone"] = text
+        data["phone"] = normalized_phone
         user = await get_user(user_id)
         address = user["address"] if user and user["address"] else "—"
-        await save_user(user_id, data.get("name", "Гость"), text, address)
+        await save_user(user_id, data.get("name", "Гость"), normalized_phone, address)
         st_set(user_id, "waiting_address", **data)
-        await api.send(chat_id, "Укажите адрес доставки:")
+        await api.send(chat_id, f"✅ Телефон сохранён: {normalized_phone}\nУкажите адрес доставки:")
         return
 
     if sname == "waiting_address":
@@ -2353,8 +2555,22 @@ async def finalize_order(chat_id, user_id, username):
         st_clear(user_id)
         return
 
+    normalized_phone = _yk_phone(data.get("phone"))
+    if not normalized_phone:
+        user = await get_user(user_id)
+        data["phone"] = user["phone"] if user and user["phone"] else ""
+        normalized_phone = _yk_phone(data["phone"])
+    if not normalized_phone:
+        st_set(user_id, "waiting_phone_payment", **data)
+        await api.send(
+            chat_id,
+            "Для фискального чека ЮKassa нужен корректный номер телефона. "
+            "Введите номер в формате +7XXXXXXXXXX:"
+        )
+        return
+    data["phone"] = normalized_phone
     await save_user(user_id, data.get("name", "—"),
-                    data.get("phone", "—"), data.get("address", "—"))
+                    normalized_phone, data.get("address", "—"))
 
     garnishes = await get_all_garnishes(user_id)
     lines, receipt_lines, total = [], [], Decimal("0")
@@ -2398,19 +2614,21 @@ async def finalize_order(chat_id, user_id, username):
     new_count = count_before + 1
     is_discount_order = (new_count % DISCOUNT_EVERY_N_ORDERS == 0)
     if is_discount_order:
-        discount_sum = total * DISCOUNT_PERCENT / Decimal("100")
+        applied_discount_percent = DISCOUNT_PERCENT
+        discount_sum = (total * DISCOUNT_PERCENT / Decimal("100")).quantize(Decimal("0.01"))
         discount_note = (f"🎉 Скидка 50% (каждый {DISCOUNT_EVERY_N_ORDERS}-й заказ): "
                          f"−{discount_sum} ₽")
         bonus_text = (f"🎉 Поздравляем! Это ваш {new_count}-й заказ — "
                       f"скидка 50% применена!\nСпасибо, что вы с нами!")
     else:
+        applied_discount_percent = Decimal("0")
         discount_sum = Decimal("0")
         discount_note = None
         remaining = DISCOUNT_EVERY_N_ORDERS - (new_count % DISCOUNT_EVERY_N_ORDERS)
         bonus_text = (f"🎁 До скидки 50% осталось {remaining} заказ(ов).\n"
                       f"Спасибо, что вы с нами!")
 
-    base = total - discount_sum
+    base = (total - discount_sum).quantize(Decimal("0.01"))
     only_test_products = bool(receipt_lines) and all(
         is_test_product({"name": name, "price": price})
         for name, qty, price in receipt_lines
@@ -2421,13 +2639,15 @@ async def finalize_order(chat_id, user_id, username):
     else:
         delivery_cost = DELIVERY_COST
         delivery_note = f"🚚 Доставка: {delivery_cost} ₽"
-    final_total = base + delivery_cost
+    final_total = (base + delivery_cost).quantize(Decimal("0.01"))
     discount_rate = (discount_sum / total) if total > 0 else Decimal("0")
 
+    valid_rows = [(k, q) for k, q in rows if k not in missing]
     order_id = await order_save(user_id, username or "—", data, items_text,
                                 final_total,
-                                delivery_time=data.get("delivery_time", "—"))
-    await order_items_save(order_id, rows, garnishes)
+                                delivery_time=data.get("delivery_time", "—"),
+                                discount_percent=applied_discount_percent)
+    await order_items_save(order_id, valid_rows, garnishes)
     await increment_order_count(user_id)
 
     manager_text = (
@@ -2457,28 +2677,30 @@ async def finalize_order(chat_id, user_id, username):
         await decrement_order_count(user_id)
         await api.send(
             chat_id,
-            "❌ Не удалось создать платёж в ЮKassa. Заказ не принят. "
-            "Пожалуйста, попробуйте ещё раз позже.",
-            attachments=[kb([[link_btn("💬 Написать кассиру", MANAGER_USERNAME)]])])
+            "❌ Не удалось создать платёж в ЮKassa. Заказ не принят, корзина сохранена. "
+            "Пожалуйста, попробуйте оформить ещё раз позже.",
+            attachments=[kb([
+                [cb_btn("🛒 Вернуться в корзину", "cart")],
+                [link_btn("💬 Написать кассиру", MANAGER_USERNAME)],
+            ])])
         log.error("ЮKassa: платёж для заказа #%s не создан; заказ отменён", order_id)
-        await cart_clear(user_id)
-        await clear_garnishes(user_id)
         st_clear(user_id)
         return
-
-    await order_set_payment_id(order_id, payment["id"])
-    log.info("ЮKassa: платёж %s создан для заказа #%s", payment["id"], order_id)
 
     pay_url = (payment.get("confirmation") or {}).get("confirmation_url")
     if not pay_url:
         await order_set_status(order_id, "cancelled")
         await decrement_order_count(user_id)
-        await api.send(chat_id, "❌ ЮKassa не вернула ссылку для оплаты. Заказ не принят.")
+        await api.send(
+            chat_id,
+            "❌ ЮKassa не вернула ссылку для оплаты. Заказ не принят, корзина сохранена.",
+            attachments=[kb([[cb_btn("🛒 Вернуться в корзину", "cart")]])])
         log.error("ЮKassa: у платежа %s отсутствует confirmation_url", payment.get("id"))
-        await cart_clear(user_id)
-        await clear_garnishes(user_id)
         st_clear(user_id)
         return
+
+    await order_set_payment_id(order_id, payment["id"], pay_url)
+    log.info("ЮKassa: платёж %s создан для заказа #%s", payment["id"], order_id)
 
     manager_sent = await api.notify_staff(
         manager_text, attachments=[manager_keyboard(order_id, "new")])
@@ -2487,8 +2709,9 @@ async def finalize_order(chat_id, user_id, username):
                   order_id)
 
     user_text = (
-        "✅ Ваш заказ оформлен! Остался последний шаг — оплатить его через ЮKassa.\n\n"
+        f"✅ Ваш заказ #{order_id} оформлен! Остался последний шаг — оплатить его через ЮKassa.\n\n"
         f"Имя: {data.get('name')}\n"
+        f"Телефон: {data.get('phone')}\n"
         f"Адрес: {data.get('address')}\n"
         f"⏰ Время доставки: {data.get('delivery_time', '—')}\n"
         f"{items_text}\n\n"
@@ -2504,6 +2727,7 @@ async def finalize_order(chat_id, user_id, username):
 
     buttons = [
         [link_btn("💳 Оплатить через ЮKassa", pay_url)],
+        [cb_btn("✏️ Изменить количество блюд", f"editorder:{order_id}")],
         [link_btn("💬 Написать кассиру", MANAGER_USERNAME)],
         [cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")],
     ]
@@ -2511,26 +2735,279 @@ async def finalize_order(chat_id, user_id, username):
     if customer_result is None:
         log.error("Не удалось отправить подтверждение заказа #%s клиенту chat_id=%s",
                   order_id, chat_id)
+    else:
+        _remember_order_ui_message(order_id, chat_id, _extract_message_id(customer_result))
 
     pay_msg = await api.send(
         chat_id,
-        "💳 **Оплата через ЮKassa**\n"
+        f"💳 **Оплата заказа #{order_id} через ЮKassa**\n"
         f"Сумма: **{final_total} ₽**\n\n"
-        "Нажмите кнопку «Оплатить через ЮKassa». Доступные способы оплаты "
-        "покажет платёжная страница. После оплаты статус обновится автоматически.",
+        "Нажмите кнопку «Оплатить через ЮKassa». Если хотите изменить количество блюд, "
+        "нажмите кнопку ниже — ссылка на оплату обновится автоматически.",
         attachments=[kb([
             [link_btn("💳 Оплатить через ЮKassa", pay_url)],
+            [cb_btn("✏️ Изменить количество блюд", f"editorder:{order_id}")],
             [cb_btn("🔄 Проверить оплату", f"paid:{order_id}")],
             [cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")],
         ])])
     if pay_msg is None:
         log.error("Не удалось отправить платёжное сообщение для заказа #%s", order_id)
+    else:
+        _remember_order_ui_message(order_id, chat_id, _extract_message_id(pay_msg))
 
-    asyncio.create_task(_yk_watch(order_id, payment["id"]))
+    _yk_start_watch(order_id, payment["id"])
 
     await cart_clear(user_id)
     await clear_garnishes(user_id)
-    st_clear(user_id) 
+    st_clear(user_id)
+
+
+async def recalculate_order(order_id, user_id, discount_percent=Decimal("0")):
+    """Пересчитывает состав, скидку, доставку, итог и строки чека по order_items."""
+    item_rows = await order_items_get_with_rowid(order_id)
+    lines, receipt_lines, detailed = [], [], []
+    subtotal = Decimal("0")
+    for row in item_rows:
+        qty = int(row["quantity"])
+        if qty <= 0:
+            continue
+        item = await menu_get(row["item_key"])
+        name = item["name"] if item else row["item_key"]
+        unit_price = Decimal(str(row["price"]))
+        pos_sum = (unit_price * qty).quantize(Decimal("0.01"))
+        subtotal += pos_sum
+        lines.append(f"• {name} ({qty} шт.) — {pos_sum} ₽")
+        garnish = row["garnish"] or ""
+        if garnish:
+            lines.append(f"   Гарнир: {GARNISH_LABELS.get(garnish, garnish)}")
+        receipt_lines.append((name, Decimal(qty), unit_price))
+        detailed.append({
+            "row_id": row["row_id"],
+            "item_key": row["item_key"],
+            "name": name,
+            "garnish": garnish,
+            "quantity": qty,
+            "price": unit_price,
+            "pos_sum": pos_sum,
+        })
+
+    items_text = "\n".join(lines)
+    disc_pct = Decimal(str(discount_percent or "0"))
+    discount_sum = (
+        (subtotal * disc_pct / Decimal("100")).quantize(Decimal("0.01"))
+        if disc_pct > 0 and subtotal > 0 else Decimal("0")
+    )
+    base = (subtotal - discount_sum).quantize(Decimal("0.01"))
+    only_test_products = bool(receipt_lines) and all(
+        is_test_product({"name": n, "price": p}) for n, _, p in receipt_lines
+    )
+    below_min = (
+        bool(detailed)
+        and subtotal < MIN_ORDER_AMOUNT
+        and not is_admin_user(user_id)
+        and not only_test_products
+    )
+    if not detailed or only_test_products or is_admin_user(user_id) or base >= FREE_DELIVERY_FROM:
+        delivery_cost = Decimal("0")
+        delivery_note = "🚚 Доставка: бесплатно"
+    else:
+        delivery_cost = DELIVERY_COST
+        delivery_note = f"🚚 Доставка: {delivery_cost} ₽"
+    final_total = (base + delivery_cost).quantize(Decimal("0.01")) if detailed else Decimal("0")
+    discount_rate = (discount_sum / subtotal) if subtotal > 0 else Decimal("0")
+    return {
+        "detailed": detailed,
+        "items_text": items_text,
+        "receipt_lines": receipt_lines,
+        "subtotal": subtotal,
+        "discount_percent": disc_pct,
+        "discount_sum": discount_sum,
+        "discount_rate": discount_rate,
+        "delivery_cost": delivery_cost,
+        "delivery_note": delivery_note,
+        "final_total": final_total,
+        "below_min": below_min,
+        "only_test_products": only_test_products,
+    }
+
+
+def _build_order_editor_view(order_id, calc, pay_url=None, notice=None):
+    """Формирует текст и клавиатуру редактора количества блюд в неоплаченном заказе."""
+    lines = [f"✏️ **Заказ #{order_id} — изменение количества блюд**", ""]
+    if notice:
+        lines.append(notice)
+        lines.append("")
+    lines.append(calc["items_text"])
+    lines.append("")
+    if calc["discount_sum"] > 0:
+        lines.append(f"🎉 Скидка {calc['discount_percent']}%: −{calc['discount_sum']} ₽")
+    lines.append(calc["delivery_note"])
+    lines.append(f"💰 **Итого: {calc['final_total']} ₽**")
+
+    if calc["below_min"]:
+        missing = (MIN_ORDER_AMOUNT - calc["subtotal"]).quantize(Decimal("0.01"))
+        lines.append(
+            f"\n⚠️ Минимальный заказ: {MIN_ORDER_AMOUNT} ₽. "
+            f"Добавьте ещё на {missing} ₽ — после этого автоматически создастся новая ссылка на оплату ЮKassa."
+        )
+    elif pay_url:
+        lines.append("\nПри любом изменении количества блюд ссылка на оплату ЮKassa создаётся заново.")
+
+    buttons = []
+    for entry in calc["detailed"]:
+        label = entry["name"][:14]
+        if entry["garnish"]:
+            g_short = "фри" if entry["garnish"] == "fries" else ("рис" if entry["garnish"] == "rice" else entry["garnish"][:5])
+            label = f"{entry['name'][:9]}({g_short})"
+        rid = entry["row_id"]
+        buttons.append([
+            cb_btn(f"➖ {label}", f"oe_sub:{order_id}:{rid}"),
+            cb_btn(f"{entry['quantity']} шт. ➕", f"oe_add:{order_id}:{rid}"),
+            cb_btn("❌", f"oe_del:{order_id}:{rid}"),
+        ])
+
+    if not calc["below_min"]:
+        if pay_url:
+            buttons.append([link_btn("💳 Оплатить через ЮKassa", pay_url)])
+            buttons.append([cb_btn("🔄 Проверить оплату", f"paid:{order_id}")])
+        else:
+            buttons.append([cb_btn("🔄 Сгенерировать ссылку на оплату", f"oe_regen:{order_id}")])
+    buttons.append([cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")])
+    return "\n".join(lines), kb(buttons)
+
+
+async def _sync_stale_order_messages(order_id, exclude_msg_id, calc, pay_url=None, cancelled=False):
+    """Обновляет ранее отправленные сообщения по заказу, чтобы убрать устаревшую ссылку оплаты."""
+    tracked = list(_order_ui_messages.get(int(order_id), []))
+    for msg_chat_id, msg_id in tracked:
+        if exclude_msg_id and str(msg_id) == str(exclude_msg_id):
+            continue
+        if cancelled:
+            await api.edit(msg_chat_id, msg_id, f"❌ Заказ #{order_id} отменён.", attachments=[])
+            continue
+        if pay_url:
+            await api.edit(
+                msg_chat_id,
+                msg_id,
+                f"🔄 **Заказ #{order_id} обновлён**\n"
+                f"Новая сумма: **{calc['final_total']} ₽**\n\n"
+                f"{calc['items_text']}\n\n"
+                "Ссылка на оплату ЮKassa обновлена на актуальную сумму.",
+                attachments=[kb([
+                    [link_btn("💳 Оплатить через ЮKassa", pay_url)],
+                    [cb_btn("✏️ Изменить количество блюд", f"editorder:{order_id}")],
+                    [cb_btn("🔄 Проверить оплату", f"paid:{order_id}")],
+                    [cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")],
+                ])],
+            )
+        else:
+            await api.edit(
+                msg_chat_id,
+                msg_id,
+                f"✏️ **Заказ #{order_id} редактируется**\n"
+                f"Текущая сумма: **{calc['final_total']} ₽**\n"
+                "Завершите изменение количества блюд, чтобы получить новую ссылку на оплату.",
+                attachments=[kb([
+                    [cb_btn("✏️ Изменить количество блюд", f"editorder:{order_id}")],
+                    [cb_btn("❌ Отменить заказ", f"cancelorder:{order_id}")],
+                ])],
+            )
+
+
+async def _regenerate_order_payment(order, user_id, chat_id, current_mid=None):
+    """Пересчитывает заказ после изменения количества блюд и генерирует новую ссылку ЮKassa."""
+    order_id = int(order["id"])
+    old_payment_id = order["payment_id"]
+    discount_pct = _item_field(order, "discount_percent", "0") or "0"
+    calc = await recalculate_order(order_id, user_id, discount_pct)
+
+    # Если удалили все блюда — отменяем заказ
+    if not calc["detailed"]:
+        _yk_stop_watch(order_id)
+        if old_payment_id:
+            asyncio.create_task(_yk_cancel_after_cancel_order(old_payment_id, order_id))
+        await order_set_status(order_id, "cancelled")
+        await order_update_details(order_id, "", Decimal("0"), None, None)
+        await decrement_order_count(user_id)
+        await _sync_stale_order_messages(order_id, current_mid, calc, cancelled=True)
+        cancel_text = f"❌ Все блюда удалены — заказ #{order_id} отменён."
+        cancel_kb = kb([[cb_btn("🏠 Главное меню", "main_menu")]])
+        if not (current_mid and await api.edit(chat_id, current_mid, cancel_text, attachments=[cancel_kb])):
+            await api.send(chat_id, cancel_text, attachments=[cancel_kb])
+        await api.notify_staff(f"❌ Клиент удалил все блюда из заказа #{order_id} — заказ отменён.")
+        return
+
+    # Если сумма ниже минимального заказа — очищаем старую ссылку и ждём увеличения
+    if calc["below_min"]:
+        _yk_stop_watch(order_id)
+        if old_payment_id:
+            asyncio.create_task(_yk_cancel_after_cancel_order(old_payment_id, order_id))
+        await order_update_details(order_id, calc["items_text"], calc["final_total"], None, None)
+        text, editor_kb = _build_order_editor_view(order_id, calc, pay_url=None)
+        if current_mid and await api.edit(chat_id, current_mid, text, attachments=[editor_kb]):
+            _remember_order_ui_message(order_id, chat_id, current_mid)
+        else:
+            sent = await api.send(chat_id, text, attachments=[editor_kb])
+            _remember_order_ui_message(order_id, chat_id, _extract_message_id(sent))
+        await _sync_stale_order_messages(order_id, current_mid, calc, pay_url=None)
+        return
+
+    # Генерируем новый платёж ЮKassa на обновлённую сумму и состав чека
+    receipt = _yk_build_receipt(
+        calc["receipt_lines"], calc["discount_rate"], calc["delivery_cost"], calc["final_total"]
+    )
+    phone = normalize_phone(order["phone"])
+    payment = await yookassa_create_payment(
+        order_id,
+        calc["final_total"],
+        f"Заказ №{order_id} — {YOOKASSA_NAME}",
+        receipt,
+        phone=phone,
+    )
+    pay_url = (payment.get("confirmation") or {}).get("confirmation_url") if payment else None
+
+    if not payment or not pay_url:
+        _yk_stop_watch(order_id)
+        if old_payment_id:
+            asyncio.create_task(_yk_cancel_after_cancel_order(old_payment_id, order_id))
+        await order_update_details(order_id, calc["items_text"], calc["final_total"], None, None)
+        text, editor_kb = _build_order_editor_view(
+            order_id,
+            calc,
+            pay_url=None,
+            notice="⚠️ Количество блюд обновлено, но не удалось создать новую ссылку ЮKassa. Нажмите «Сгенерировать ссылку на оплату».",
+        )
+        if current_mid and await api.edit(chat_id, current_mid, text, attachments=[editor_kb]):
+            _remember_order_ui_message(order_id, chat_id, current_mid)
+        else:
+            sent = await api.send(chat_id, text, attachments=[editor_kb])
+            _remember_order_ui_message(order_id, chat_id, _extract_message_id(sent))
+        await _sync_stale_order_messages(order_id, current_mid, calc, pay_url=None)
+        return
+
+    # Новый платёж успешно создан — отменяем старое наблюдение и запускаем новое
+    _yk_stop_watch(order_id)
+    if old_payment_id and old_payment_id != payment["id"]:
+        asyncio.create_task(_yk_cancel_after_cancel_order(old_payment_id, order_id))
+    await order_update_details(
+        order_id, calc["items_text"], calc["final_total"], payment["id"], pay_url
+    )
+    log.info("ЮKassa: для заказа #%s создан новый платёж %s на сумму %s ₽",
+             order_id, payment["id"], calc["final_total"])
+    _yk_start_watch(order_id, payment["id"])
+
+    text, editor_kb = _build_order_editor_view(
+        order_id,
+        calc,
+        pay_url=pay_url,
+        notice="✅ Количество обновлено — новая ссылка на оплату ЮKassa готова!",
+    )
+    if current_mid and await api.edit(chat_id, current_mid, text, attachments=[editor_kb]):
+        _remember_order_ui_message(order_id, chat_id, current_mid)
+    else:
+        sent = await api.send(chat_id, text, attachments=[editor_kb])
+        _remember_order_ui_message(order_id, chat_id, _extract_message_id(sent))
+    await _sync_stale_order_messages(order_id, current_mid, calc, pay_url=pay_url) 
 # ================= ОБРАБОТКА CALLBACK =================
 async def handle_callback(update):
     cb = update.get("callback") or {}
@@ -2729,10 +3206,17 @@ async def handle_callback(update):
 
     if payload.startswith("cartadd:"):
         key = payload.split(":", 1)[1]
+        item_key, _ = parse_cart_key(key)
+        item = await menu_get(item_key)
+        if not item or not item["active"] or (item["stock"] is not None and item["stock"] <= 0):
+            await ack("Блюдо недоступно")
+            return
         await cart_add(user_id, key)
         await ack("Добавлено")
         text, cart_kb = await cart_text_and_keyboard(user_id)
-        await api.send(chat_id, text, attachments=[cart_kb])
+        current_mid = _extract_message_id(msg)
+        if not (current_mid and await api.edit(chat_id, current_mid, text, attachments=[cart_kb])):
+            await api.send(chat_id, text, attachments=[cart_kb])
         return
 
     if payload.startswith("cartsub:"):
@@ -2740,7 +3224,9 @@ async def handle_callback(update):
         await cart_remove_one(user_id, key)
         await ack()
         text, cart_kb = await cart_text_and_keyboard(user_id)
-        await api.send(chat_id, text, attachments=[cart_kb])
+        current_mid = _extract_message_id(msg)
+        if not (current_mid and await api.edit(chat_id, current_mid, text, attachments=[cart_kb])):
+            await api.send(chat_id, text, attachments=[cart_kb])
         return
 
     if payload.startswith("cartdel:"):
@@ -2748,7 +3234,9 @@ async def handle_callback(update):
         await cart_delete_item(user_id, key)
         await ack("Удалено")
         text, cart_kb = await cart_text_and_keyboard(user_id)
-        await api.send(chat_id, text, attachments=[cart_kb])
+        current_mid = _extract_message_id(msg)
+        if not (current_mid and await api.edit(chat_id, current_mid, text, attachments=[cart_kb])):
+            await api.send(chat_id, text, attachments=[cart_kb])
         return
 
     if payload == "cart_clear":
@@ -2756,7 +3244,9 @@ async def handle_callback(update):
         await clear_garnishes(user_id)
         await ack("Корзина очищена")
         text, cart_kb = await cart_text_and_keyboard(user_id)
-        await api.send(chat_id, text, attachments=[cart_kb])
+        current_mid = _extract_message_id(msg)
+        if not (current_mid and await api.edit(chat_id, current_mid, text, attachments=[cart_kb])):
+            await api.send(chat_id, text, attachments=[cart_kb])
         return
 
     if payload == "order":
@@ -2766,12 +3256,15 @@ async def handle_callback(update):
             return
         # Считаем сумму, чтобы проверить минимальный заказ
         total = Decimal("0")
+        only_test_products = True
         for key, qty in rows:
             item_key, _ = parse_cart_key(key)
             item = await menu_get(item_key)
             if item:
+                if not is_test_product(item):
+                    only_test_products = False
                 total += Decimal(item["price"]) * qty
-        if total < MIN_ORDER_AMOUNT and not is_admin_user(user_id):
+        if total < MIN_ORDER_AMOUNT and not is_admin_user(user_id) and not only_test_products:
             await ack(f"Минимальный заказ {MIN_ORDER_AMOUNT} ₽")
             return
         user = await get_user(user_id)
@@ -2782,12 +3275,18 @@ async def handle_callback(update):
             await api.send(chat_id, "Укажите ваше имя:")
             return
         data["name"] = user["name"]
-        if not user["phone"] or user["phone"] == "—":
+        saved_phone = normalize_phone(user["phone"]) if user["phone"] and user["phone"] != "—" else None
+        if not saved_phone:
             st_set(user_id, "waiting_phone", **data)
             await ack()
-            await api.send(chat_id, "Укажите номер телефона:")
+            await api.send(
+                chat_id,
+                "Укажите номер телефона (можно с 8 или без кода — бот автоматически приведёт к +7):"
+            )
             return
-        data["phone"] = user["phone"]
+        if saved_phone != user["phone"]:
+            await save_user(user_id, user["name"], saved_phone, user["address"] or "—")
+        data["phone"] = saved_phone
         if not user["address"] or user["address"] == "—":
             st_set(user_id, "waiting_address", **data)
             await ack()
@@ -2825,7 +3324,10 @@ async def handle_callback(update):
     if payload == "edit_phone":
         st_set(user_id, "edit_phone")
         await ack()
-        await api.send(chat_id, "Введите новый номер телефона:")
+        await api.send(
+            chat_id,
+            "Введите новый номер телефона (можно с 8 или без кода — бот автоматически приведёт к +7):"
+        )
         return
 
     if payload == "edit_address":
@@ -2879,18 +3381,121 @@ async def handle_callback(update):
                            attachments=[kb([[cb_btn("🏠 Главное меню", "main_menu")]])])
             return
         lines = []
+        hist_buttons = []
         for o in orders:
             status = STATUS_LABELS.get(o["status"], o["status"])
             lines.append(f"#{o['id']} — {o['total']} ₽ — {status} — {o['created_at']}")
+            if o["status"] == "new":
+                hist_buttons.append([cb_btn(f"✏️ Изменить / оплатить заказ #{o['id']}", f"editorder:{o['id']}")])
+        hist_buttons.append([cb_btn("🏠 Главное меню", "main_menu")])
         await ack()
         await api.send(chat_id, "📜 **Ваши последние заказы:**\n\n" + "\n".join(lines),
-                       attachments=[kb([[cb_btn("🏠 Главное меню", "main_menu")]])])
+                       attachments=[kb(hist_buttons)])
+        return
+
+    if payload.startswith("editorder:"):
+        parts = payload.split(":")
+        if len(parts) != 2 or not parts[1].isdigit():
+            await ack("Некорректный заказ")
+            return
+        order_id = int(parts[1])
+        async with _order_edit_lock(order_id):
+            order = await order_get(order_id)
+            if not order or order["user_id"] != user_id:
+                await ack("Заказ не найден")
+                return
+            if order["status"] != "new":
+                await ack("Изменить можно только неоплаченный заказ")
+                return
+            if order["payment_id"]:
+                pinfo = await yookassa_get_payment(order["payment_id"])
+                if pinfo and pinfo.get("status") == "succeeded":
+                    await order_set_status(order_id, "paid")
+                    await _yk_notify_paid(order_id)
+                    await ack("Заказ уже оплачен")
+                    return
+            discount_pct = _item_field(order, "discount_percent", "0") or "0"
+            calc = await recalculate_order(order_id, user_id, discount_pct)
+            if not calc["detailed"]:
+                await ack("В заказе нет блюд")
+                return
+            pay_url = _item_field(order, "payment_url")
+            if not pay_url and order["payment_id"]:
+                pinfo = await yookassa_get_payment(order["payment_id"])
+                if pinfo and pinfo.get("status") == "pending":
+                    pay_url = (pinfo.get("confirmation") or {}).get("confirmation_url")
+            text, editor_kb = _build_order_editor_view(order_id, calc, pay_url=pay_url)
+            await ack()
+            current_mid = _extract_message_id(msg)
+            if current_mid and await api.edit(chat_id, current_mid, text, attachments=[editor_kb]):
+                _remember_order_ui_message(order_id, chat_id, current_mid)
+            else:
+                sent = await api.send(chat_id, text, attachments=[editor_kb])
+                _remember_order_ui_message(order_id, chat_id, _extract_message_id(sent))
+        return
+
+    if payload.startswith(("oe_add:", "oe_sub:", "oe_del:", "oe_regen:")):
+        parts = payload.split(":")
+        action_prefix = parts[0]
+        if action_prefix == "oe_regen":
+            if len(parts) != 2 or not parts[1].isdigit():
+                await ack("Некорректный заказ")
+                return
+            order_id, row_id = int(parts[1]), None
+        else:
+            if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+                await ack("Некорректные данные")
+                return
+            order_id, row_id = int(parts[1]), int(parts[2])
+
+        async with _order_edit_lock(order_id):
+            order = await order_get(order_id)
+            if not order or order["user_id"] != user_id:
+                await ack("Заказ не найден")
+                return
+            if order["status"] != "new":
+                await ack("Заказ уже нельзя изменить")
+                return
+            if order["payment_id"]:
+                pinfo = await yookassa_get_payment(order["payment_id"])
+                if pinfo and pinfo.get("status") == "succeeded":
+                    await order_set_status(order_id, "paid")
+                    await _yk_notify_paid(order_id)
+                    await ack("Заказ уже оплачен")
+                    return
+
+            if action_prefix in ("oe_add", "oe_sub", "oe_del"):
+                row = await order_item_get_by_rowid(order_id, row_id)
+                if not row:
+                    await ack("Позиция уже изменена")
+                    return
+                if action_prefix == "oe_add":
+                    item = await menu_get(row["item_key"])
+                    if item and (not item["active"] or (item["stock"] is not None and item["stock"] <= 0)):
+                        await ack("Блюдо сейчас недоступно")
+                        return
+                    if item and item["stock"] is not None and int(row["quantity"]) + 1 > int(item["stock"]):
+                        await ack(f"В наличии только {item['stock']} шт.")
+                        return
+                    if int(row["quantity"]) >= 99:
+                        await ack("Максимум 99 шт. на позицию")
+                        return
+                    await order_item_change_qty(order_id, row_id, 1)
+                elif action_prefix == "oe_sub":
+                    await order_item_change_qty(order_id, row_id, -1)
+                elif action_prefix == "oe_del":
+                    await order_item_delete_by_rowid(order_id, row_id)
+
+            await ack("Обновляю заказ и ссылку на оплату...")
+            current_mid = _extract_message_id(msg)
+            await _regenerate_order_payment(order, user_id, chat_id, current_mid=current_mid)
         return
 
     if payload.startswith("cancelorder:"):
         order_id = int(payload.split(":")[1])
         ok = await order_cancel_if_allowed(order_id, user_id)
         if ok:
+            _yk_stop_watch(order_id)
             await ack("Заказ отменён")
             order = await order_get(order_id)
             if order and order["payment_id"]:
@@ -3385,7 +3990,7 @@ async def main():
     try:
         # Подхватываем незавершённые платежи после перезапуска.
         for row in await orders_pending_yookassa():
-            asyncio.create_task(_yk_watch(row["id"], row["payment_id"]))
+            _yk_start_watch(row["id"], row["payment_id"])
         marker = None
         log.info("Бот запущен. Ожидаю события MAX...")
         while True:
